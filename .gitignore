@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+*.log
+.env
+all_python_codes.txt
+*.mp4
+*.gif
