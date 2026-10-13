@@ -165,9 +165,9 @@ Development diagnostics (`diagnose_leg_sides.py`, `scripts/test_actuators.py`, `
 If you use this code, please cite the paper. The author list and publication details will be added when available.
 
 ```bibtex
-@misc{neural_intent_morphology_robustness,
+
   title        = Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion,
   author       = Maitree Jaiswal,
   url          = https://github.com/maitreejais-pixel/neural-intent-morphology-robustness
-}
+
 ```
