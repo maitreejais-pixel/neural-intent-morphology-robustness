@@ -9,6 +9,7 @@ from src.env import MorphologyAntEnv
 from src.controllers import (
     DirectTrajectoryController,
     FixedCPGController,
+    ZeroActionController,
 )
 
 # NOTE on morphology_observation / morphology array handling:
@@ -18,7 +19,8 @@ from src.controllers import (
 # Both of these match env.py's corrected parameter name and reset()'s
 # array-accepting logic, so no change was needed for that.
 #
-# FIXED (this revision): two real bugs in the metric collection below.
+# FIXED (earlier revision): two real bugs in the metric collection
+# below.
 #
 # 1. Both run_classical() and run_ppo() only reported the reward from
 #    the LAST step of the episode ("reward": float(reward)), not the
@@ -26,23 +28,38 @@ from src.controllers import (
 #    this correctly (total_reward += float(reward)); this file did
 #    not. Fixed by accumulating total_reward across the whole episode.
 #
-# 2. Neither function terminates the episode when the robot falls
-#    (env.py has no fall-based termination), so the "distance",
-#    "forward_distance", "yaw_change", and "energy" fields were being
-#    read from last_info AFTER the full episode -- meaning, for any
-#    episode where a fall occurred, those numbers included however
-#    many remaining steps of post-fall tumbling happened afterward,
-#    not just the real walking distance/energy. This is the exact
-#    same contamination bug found and fixed in test_intentions.py
-#    (see that file's history for the original diagnosis). Fixed by
-#    snapshotting those four fields at the moment info["fallen"]
-#    first becomes True, and using the final-step values only when
-#    the episode never fell.
+# 2. Historically, episodes were not terminated when the robot fell,
+#    so the "distance", "forward_distance", "yaw_change", and
+#    "energy" fields were read from last_info AFTER the full episode
+#    -- meaning, for any episode where a fall occurred, those numbers
+#    included however many remaining steps of post-fall tumbling
+#    happened afterward, not just the real walking distance/energy.
+#    Fixed by snapshotting those four fields at the moment
+#    info["fallen"] first becomes True, and using the final-step
+#    values only when the episode never fell. (env.py now also ends
+#    the episode on a fall; the snapshot is kept so the two behave
+#    consistently.)
 #
 # "fallen", "fall_step", "recovery_time", and "steps" are left as
 # final-episode values on purpose -- those are meant to describe the
 # whole episode (whether/when it fell, whether/when it recovered),
 # not a walking-phase snapshot.
+#
+# ADDED (this revision):
+#
+# - A "standstill" reference controller (ZeroActionController: zero
+#   torque at every step) so that the reward can be calibrated against
+#   an Ant that does nothing.
+#
+# - A --controllers option so that a subset of controllers can be run
+#   (for example only the stand-still reference) without re-running
+#   everything. The default runs exactly the same three controllers,
+#   with exactly the same seeds, as before, so existing results
+#   reproduce.
+
+
+ALL_CONTROLLERS = ("direct", "cpg", "ppo", "standstill")
+DEFAULT_CONTROLLERS = ("direct", "cpg", "ppo")
 
 
 # ======================================================================
@@ -108,6 +125,7 @@ def run_classical(
     Controllers:
         direct
         cpg
+        standstill   (zero-torque reference)
     """
 
     rows = []
@@ -137,6 +155,9 @@ def run_classical(
         elif name == "cpg":
             controller = FixedCPGController()
 
+        elif name == "standstill":
+            controller = ZeroActionController()
+
         else:
             raise ValueError(
                 f"Unknown classical controller: {name}"
@@ -162,11 +183,15 @@ def run_classical(
             episode_steps
         ):
 
-            # Frozen intention sequence is deliberately
-            # generated deterministically from the episode seed.
+            # Fixed, noise-free intention schedule:
             #
-            # This means every controller receives the same
-            # intention sequence for a given episode.
+            #   Forward -> Left -> Right -> Stop, 150 steps each,
+            #   repeating for the whole episode.
+            #
+            # The schedule depends only on the step index. It does NOT
+            # depend on the episode seed, and it does NOT come from
+            # the EEG decoder. Every controller receives the same
+            # schedule in every episode.
             intention = int(
                 (step // 150) % 4
             )
@@ -334,8 +359,8 @@ def run_ppo(
             episode_steps
         ):
 
-            # Same deterministic intention schedule used
-            # for the classical controllers.
+            # Same fixed intention schedule used for the classical
+            # controllers (see run_classical).
             intention = int(
                 (step // 150) % 4
             )
@@ -501,10 +526,15 @@ def save_results(
     rows,
     output_path,
 ):
-    os.makedirs(
-        os.path.dirname(output_path),
-        exist_ok=True,
+    output_dir = os.path.dirname(
+        output_path
     )
+
+    if output_dir:
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
 
     fieldnames = [
         "controller",
@@ -581,9 +611,21 @@ def main():
     )
 
     parser.add_argument(
+        "--controllers",
+        nargs="+",
+        choices=ALL_CONTROLLERS,
+        default=list(DEFAULT_CONTROLLERS),
+        help=(
+            "Which controllers to run. Default: direct cpg ppo "
+            "(the original three). Add 'standstill' for the "
+            "zero-torque reference."
+        ),
+    )
+
+    parser.add_argument(
         "--model",
         default="models/morphology_ant_ppo.zip",
-        help="Path to trained PPO model.",
+        help="Path to trained PPO model (only needed for 'ppo').",
     )
 
     parser.add_argument(
@@ -595,15 +637,19 @@ def main():
     args = parser.parse_args()
 
     # --------------------------------------------------------------
-    # Load PPO
+    # Load PPO (only if it will be used)
     # --------------------------------------------------------------
 
-    if not os.path.exists(
-        args.model
-    ):
-        raise FileNotFoundError(
-            f"PPO model not found: {args.model}"
-        )
+    model = None
+
+    if "ppo" in args.controllers:
+
+        if not os.path.exists(
+            args.model
+        ):
+            raise FileNotFoundError(
+                f"PPO model not found: {args.model}"
+            )
 
     print()
     print("=" * 70)
@@ -611,22 +657,33 @@ def main():
     print("=" * 70)
     print()
     print(
-        f"PPO model : {args.model}"
+        f"Controllers : {args.controllers}"
+    )
+
+    if "ppo" in args.controllers:
+        print(
+            f"PPO model   : {args.model}"
+        )
+
+    print(
+        f"Episodes    : {args.episodes}"
     )
     print(
-        f"Episodes  : {args.episodes}"
+        f"Steps       : {args.steps}"
     )
     print(
-        f"Steps     : {args.steps}"
+        f"Levels      : {args.levels}"
     )
     print(
-        f"Levels    : {args.levels}"
+        f"Output      : {args.output}"
     )
     print()
 
-    model = PPO.load(
-        args.model
-    )
+    if "ppo" in args.controllers:
+
+        model = PPO.load(
+            args.model
+        )
 
     rows = []
 
@@ -654,58 +711,88 @@ def main():
             # Direct baseline
             # ------------------------------------------------------
 
-            print(
-                "  Running Direct..."
-            )
+            if "direct" in args.controllers:
 
-            rows.extend(
-                run_classical(
-                    name="direct",
-                    episodes=args.episodes,
-                    axis=axis,
-                    level=level,
-                    seed0=1000,
-                    episode_steps=args.steps,
+                print(
+                    "  Running Direct..."
                 )
-            )
+
+                rows.extend(
+                    run_classical(
+                        name="direct",
+                        episodes=args.episodes,
+                        axis=axis,
+                        level=level,
+                        seed0=1000,
+                        episode_steps=args.steps,
+                    )
+                )
 
             # ------------------------------------------------------
             # Fixed CPG baseline
             # ------------------------------------------------------
 
-            print(
-                "  Running CPG..."
-            )
+            if "cpg" in args.controllers:
 
-            rows.extend(
-                run_classical(
-                    name="cpg",
-                    episodes=args.episodes,
-                    axis=axis,
-                    level=level,
-                    seed0=2000,
-                    episode_steps=args.steps,
+                print(
+                    "  Running CPG..."
                 )
-            )
+
+                rows.extend(
+                    run_classical(
+                        name="cpg",
+                        episodes=args.episodes,
+                        axis=axis,
+                        level=level,
+                        seed0=2000,
+                        episode_steps=args.steps,
+                    )
+                )
 
             # ------------------------------------------------------
             # Morphology-aware PPO
             # ------------------------------------------------------
 
-            print(
-                "  Running morphology-aware PPO..."
-            )
+            if "ppo" in args.controllers:
 
-            rows.extend(
-                run_ppo(
-                    model=model,
-                    episodes=args.episodes,
-                    axis=axis,
-                    level=level,
-                    seed0=3000,
-                    episode_steps=args.steps,
+                print(
+                    "  Running morphology-aware PPO..."
                 )
-            )
+
+                rows.extend(
+                    run_ppo(
+                        model=model,
+                        episodes=args.episodes,
+                        axis=axis,
+                        level=level,
+                        seed0=3000,
+                        episode_steps=args.steps,
+                    )
+                )
+
+            # ------------------------------------------------------
+            # Stand-still reference (zero torque)
+            #
+            # Uses seed block 1000-1009, the same block as Direct, so
+            # the two start from identical initial states.
+            # ------------------------------------------------------
+
+            if "standstill" in args.controllers:
+
+                print(
+                    "  Running stand-still reference..."
+                )
+
+                rows.extend(
+                    run_classical(
+                        name="standstill",
+                        episodes=args.episodes,
+                        axis=axis,
+                        level=level,
+                        seed0=1000,
+                        episode_steps=args.steps,
+                    )
+                )
 
     # --------------------------------------------------------------
     # Save

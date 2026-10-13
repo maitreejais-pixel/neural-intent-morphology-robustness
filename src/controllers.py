@@ -29,6 +29,10 @@ class AntController:
             Learned policy.
             Uses the complete observation containing:
                 Ant state + morphology + intention.
+
+        Stand-still reference:
+            Zero torque at every step. Used only to calibrate the
+            reward (see ZeroActionController at the end of this file).
     """
 
     ACTION_DIM = 8
@@ -201,6 +205,10 @@ class DirectTrajectoryController(AntController):
         self,
         amplitude=0.45,
         frequency=1.5,
+        # NOTE: 0.01 s is the MuJoCo physics timestep, but one control
+        # step lasts 0.05 s (frame_skip = 5). The gait therefore runs at
+        # 0.2 * frequency Hz in real time (frequency=1.5 -> 0.3 Hz).
+        # Left unchanged so the published results reproduce.
         dt=0.01,
     ):
         super().__init__()
@@ -441,6 +449,10 @@ class FixedCPGController(AntController):
         kp=1.8,
         kd=0.20,
         action_scale=2.0,
+        # NOTE: 0.01 s is the MuJoCo physics timestep, but one control
+        # step lasts 0.05 s (frame_skip = 5). The gait therefore runs at
+        # 0.2 * frequency Hz in real time (frequency=1.5 -> 0.3 Hz).
+        # Left unchanged so the published results reproduce.
         dt=0.01,
     ):
         super().__init__()
@@ -898,6 +910,35 @@ class MorphologyAwarePPOController(AntController):
             -1.0,
             1.0,
         ).astype(np.float32)
+
+        self.previous_action[:] = action
+
+        return action
+
+
+# ======================================================================
+# STAND-STILL REFERENCE CONTROLLER
+# ======================================================================
+
+class ZeroActionController(AntController):
+    """
+    Stand-still reference: outputs zero torque at every step.
+
+    Used only to calibrate the reward (what does an Ant that does
+    nothing score?). Uses no time, intention, observation, feedback,
+    morphology, or learned parameters.
+    """
+
+    def act(
+        self,
+        intention,
+        step,
+        obs=None,
+    ):
+        action = np.zeros(
+            self.ACTION_DIM,
+            dtype=np.float32,
+        )
 
         self.previous_action[:] = action
 

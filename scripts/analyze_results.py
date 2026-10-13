@@ -1,18 +1,21 @@
+import argparse
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-RESULTS_DIR = "results"
-INPUT_FILE = os.path.join(
-    RESULTS_DIR,
-    "physics_results.csv",
-)
+# Defaults reproduce the original behavior exactly (same input file,
+# same output folder). To analyze a results file that also contains the
+# stand-still reference WITHOUT overwriting the existing summary and
+# plots, pass --input and --outdir, e.g.:
+#
+#   python scripts/analyze_results.py \
+#       --input results/physics_results_with_standstill.csv \
+#       --outdir results_with_standstill
+#
+DEFAULT_INPUT = os.path.join("results", "physics_results.csv")
+DEFAULT_OUTDIR = "results"
 
-SUMMARY_FILE = os.path.join(
-    RESULTS_DIR,
-    "summary.csv",
-)
 
 # FIXED: this script previously used DISTANCE (raw net displacement)
 # as the primary "retained performance" metric and as the sole basis
@@ -37,9 +40,52 @@ SUMMARY_FILE = os.path.join(
 # every episode. This script now treats REWARD as the primary
 # performance metric, with distance and fall rate kept as supporting,
 # clearly-labeled context rather than the headline number.
+#
+# ADDED: if the results file contains a "standstill" controller (zero
+# torque at every step), the summary gains two columns,
+# standstill_reward_mean and reward_minus_standstill, and a table
+# comparing every controller to the stand-still reference is printed.
+# This calibrates the reward: a policy that does nothing scores about
+# 672 at nominal morphology, so a high reward alone does not show that
+# a controller is locomoting or following commands.
+# "Best controller by condition" is still ranked among the real
+# controllers only (the stand-still reference is excluded from it).
+
+REFERENCE_CONTROLLER = "standstill"
 
 
 def main():
+
+    parser = argparse.ArgumentParser(
+        description="Analyze full-physics MuJoCo results."
+    )
+
+    parser.add_argument(
+        "--input",
+        default=DEFAULT_INPUT,
+        help="Per-episode results CSV.",
+    )
+
+    parser.add_argument(
+        "--outdir",
+        default=DEFAULT_OUTDIR,
+        help="Folder for summary CSVs and plots.",
+    )
+
+    args = parser.parse_args()
+
+    INPUT_FILE = args.input
+    RESULTS_DIR = args.outdir
+
+    os.makedirs(
+        RESULTS_DIR,
+        exist_ok=True,
+    )
+
+    SUMMARY_FILE = os.path.join(
+        RESULTS_DIR,
+        "summary.csv",
+    )
 
     # ---------------------------------------------------------
     # Load results
@@ -55,6 +101,14 @@ def main():
     print("=" * 90)
     print("FULL-PHYSICS MUJOCO RESULTS ANALYSIS")
     print("=" * 90)
+
+    print(
+        f"Input file: {INPUT_FILE}"
+    )
+
+    print(
+        f"Output folder: {RESULTS_DIR}"
+    )
 
     print(
         f"Rows loaded: {len(df)}"
@@ -139,6 +193,9 @@ def main():
 
     # ---------------------------------------------------------
     # Retained distance (kept for reference -- see caveat above)
+    #
+    # Note: for the stand-still reference, nominal distance is close
+    # to zero, so this percentage is not meaningful for it.
     # ---------------------------------------------------------
 
     df["retained_percent"] = (
@@ -239,6 +296,40 @@ def main():
     summary["fall_rate_percent"] = 100.0 * summary["fall_rate"]
 
     # ---------------------------------------------------------
+    # Stand-still reference comparison (only if present)
+    # ---------------------------------------------------------
+
+    has_reference = (
+        REFERENCE_CONTROLLER
+        in summary["controller"].values
+    )
+
+    if has_reference:
+
+        reference = (
+            summary[
+                summary["controller"]
+                == REFERENCE_CONTROLLER
+            ][["axis", "level", "reward_mean"]]
+            .rename(
+                columns={
+                    "reward_mean": "standstill_reward_mean",
+                }
+            )
+        )
+
+        summary = summary.merge(
+            reference,
+            on=["axis", "level"],
+            how="left",
+        )
+
+        summary["reward_minus_standstill"] = (
+            summary["reward_mean"]
+            - summary["standstill_reward_mean"]
+        )
+
+    # ---------------------------------------------------------
     # Save summary
     # ---------------------------------------------------------
 
@@ -266,6 +357,39 @@ def main():
     print()
 
     print(summary.to_string(index=False))
+
+    if has_reference:
+
+        print()
+        print("=" * 90)
+        print(
+            "REWARD MINUS STAND-STILL REFERENCE "
+            "(negative = scores below a do-nothing policy)"
+        )
+        print("=" * 90)
+
+        comparison = (
+            summary[
+                summary["controller"]
+                != REFERENCE_CONTROLLER
+            ]
+            .pivot_table(
+                index=["axis", "level"],
+                columns="controller",
+                values="reward_minus_standstill",
+            )
+            .reset_index()
+        )
+
+        print(comparison.to_string(index=False))
+
+        comparison.to_csv(
+            os.path.join(
+                RESULTS_DIR,
+                "reward_minus_standstill.csv",
+            ),
+            index=False,
+        )
 
     # ---------------------------------------------------------
     # Controller-level nominal performance
@@ -414,32 +538,42 @@ def main():
 
     # ---------------------------------------------------------
     # Best controller at each perturbation -- FIXED: now ranked by
-    # reward_mean, not distance-based retained_mean.
+    # reward_mean, not distance-based retained_mean. The stand-still
+    # reference is a calibration baseline, not a candidate controller,
+    # so it is excluded from this ranking (its reward is reported
+    # alongside instead).
     # ---------------------------------------------------------
 
     best_rows = []
 
+    candidates = summary[
+        summary["controller"] != REFERENCE_CONTROLLER
+    ]
+
     for axis in axes:
         for level in sorted(summary["level"].unique()):
-            d = summary[
-                (summary["axis"] == axis)
-                & (summary["level"] == level)
+            d = candidates[
+                (candidates["axis"] == axis)
+                & (candidates["level"] == level)
             ]
             if len(d) == 0:
                 continue
             best = d.loc[d["reward_mean"].idxmax()]
-            best_rows.append(
-                {
-                    "axis": axis,
-                    "level": level,
-                    "best_controller": best["controller"],
-                    "reward_mean": best["reward_mean"],
-                    "retained_percent_distance_reference": best[
-                        "retained_mean"
-                    ],
-                    "fall_rate_percent": best["fall_rate_percent"],
-                }
-            )
+            row = {
+                "axis": axis,
+                "level": level,
+                "best_controller": best["controller"],
+                "reward_mean": best["reward_mean"],
+                "retained_percent_distance_reference": best[
+                    "retained_mean"
+                ],
+                "fall_rate_percent": best["fall_rate_percent"],
+            }
+            if has_reference:
+                row["standstill_reward_mean"] = best[
+                    "standstill_reward_mean"
+                ]
+            best_rows.append(row)
 
     best_df = pd.DataFrame(best_rows)
 
@@ -450,7 +584,10 @@ def main():
 
     print()
     print("=" * 90)
-    print("BEST CONTROLLER BY CONDITION (ranked by reward_mean)")
+    print(
+        "BEST CONTROLLER BY CONDITION (ranked by reward_mean, "
+        "stand-still reference excluded)"
+    )
     print("=" * 90)
     print(best_df.to_string(index=False))
 
