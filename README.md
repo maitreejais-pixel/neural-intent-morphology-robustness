@@ -166,8 +166,8 @@ If you use this code, please cite the paper. The author list and publication det
 
 ```bibtex
 @misc{neural_intent_morphology_robustness,
-  title        = {Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion},
+  title        = Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion,
   author       = Maitree Jaiswal,
-  url          = {https://github.com/maitreejais-pixel/neural-intent-morphology-robustness}
+  url          = https://github.com/maitreejais-pixel/neural-intent-morphology-robustness
 }
 ```
