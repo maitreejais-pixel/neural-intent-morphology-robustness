@@ -1,9 +1,69 @@
+"""
+Full-physics MuJoCo morphology robustness experiments.
+
+Run from the project root. Example:
+
+    python scripts/run_experiments.py \
+        --controllers direct cpg ppo ppo_nomorph standstill \
+        --model models/ppo_seed42.zip \
+        --model-nomorph models/ppo_nomorph_seed42.zip \
+        --output results/physics_results.csv
+
+    python scripts/analyze_results.py --input results/physics_results.csv
+
+CHANGES vs. the previous version
+--------------------------------
+1. ALL controllers now use the SAME block of initial-state seeds
+   (--seed0, default 1000), so episodes are PAIRED across controllers.
+   Before, every controller had its own seed block (Direct 1000-1009,
+   CPG 2000-2009, PPO 3000-3009), which made comparisons unpaired.
+2. New controller "ppo_nomorph": the domain-randomization-only PPO
+   ablation (trained with --no-morph). It does not observe the
+   morphology vector, so comparing it with "ppo" isolates the effect of
+   conditioning on morphology. Needs --model-nomorph.
+3. Extra metrics that separate locomotion from standing still:
+       task_reward    tracking reward only (stand-still scores ~150)
+       fwd_vel_err    mean |forward speed - target| in Forward segments
+       yaw_rate_err   mean |yaw rate - target| in Left/Right segments
+       stop_speed     mean residual speed in Stop segments
+4. The episode logic itself (intention schedule, observation refresh,
+   fall snapshot, metric collection) lives in src/protocol.py and is
+   shared with eval_checkpoints.py, so checkpoint selection and the
+   final evaluation cannot drift apart.
+5. The default controller list now includes the stand-still reference,
+   because analyze_results.py compares every controller against it.
+
+Kept from earlier revisions (see src/protocol.py run_episode):
+
+ * Total episode reward is accumulated over the whole episode.
+ * distance / forward_distance / yaw_change / energy are snapshotted at
+   the moment of the first fall (or taken at the end of the episode if
+   the robot never fell), so post-fall tumbling does not contaminate
+   them. env.py also ends the episode on a fall.
+ * "fallen", "fall_step" and "steps" describe the whole episode.
+   ("recovery_time" is always empty: episodes end at the first fall.)
+ * The intention schedule is fixed and noise-free:
+       Forward -> Left -> Right -> Stop, 150 steps each, repeating.
+   It depends only on the step index, not on the episode seed, and it
+   does not come from the EEG decoder. Every controller receives the
+   same schedule in every episode.
+"""
+
 import argparse
 import csv
 import os
+import sys
 
-import numpy as np
-from stable_baselines3 import PPO
+# Make "from src..." work whether this file is run as
+# "python scripts/run_experiments.py" or "python -m scripts.run_experiments".
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    ),
+)
 
 from src.env import MorphologyAntEnv
 from src.controllers import (
@@ -11,55 +71,64 @@ from src.controllers import (
     FixedCPGController,
     ZeroActionController,
 )
-
-# NOTE on morphology_observation / morphology array handling:
-# This file already called MorphologyAntEnv(morphology_observation=...)
-# and checked env.morphology_observation, and it already passes
-# morphology as a 4-element NumPy array to env.reset(morphology=...).
-# Both of these match env.py's corrected parameter name and reset()'s
-# array-accepting logic, so no change was needed for that.
-#
-# FIXED (earlier revision): two real bugs in the metric collection
-# below.
-#
-# 1. Both run_classical() and run_ppo() only reported the reward from
-#    the LAST step of the episode ("reward": float(reward)), not the
-#    accumulated episode total. evaluate_intentions.py already did
-#    this correctly (total_reward += float(reward)); this file did
-#    not. Fixed by accumulating total_reward across the whole episode.
-#
-# 2. Historically, episodes were not terminated when the robot fell,
-#    so the "distance", "forward_distance", "yaw_change", and
-#    "energy" fields were read from last_info AFTER the full episode
-#    -- meaning, for any episode where a fall occurred, those numbers
-#    included however many remaining steps of post-fall tumbling
-#    happened afterward, not just the real walking distance/energy.
-#    Fixed by snapshotting those four fields at the moment
-#    info["fallen"] first becomes True, and using the final-step
-#    values only when the episode never fell. (env.py now also ends
-#    the episode on a fall; the snapshot is kept so the two behave
-#    consistently.)
-#
-# "fallen", "fall_step", "recovery_time", and "steps" are left as
-# final-episode values on purpose -- those are meant to describe the
-# whole episode (whether/when it fell, whether/when it recovered),
-# not a walking-phase snapshot.
-#
-# ADDED (this revision):
-#
-# - A "standstill" reference controller (ZeroActionController: zero
-#   torque at every step) so that the reward can be calibrated against
-#   an Ant that does nothing.
-#
-# - A --controllers option so that a subset of controllers can be run
-#   (for example only the stand-still reference) without re-running
-#   everything. The default runs exactly the same three controllers,
-#   with exactly the same seeds, as before, so existing results
-#   reproduce.
+from src.protocol import (
+    morphology_params,
+    run_episode,
+)
 
 
-ALL_CONTROLLERS = ("direct", "cpg", "ppo", "standstill")
-DEFAULT_CONTROLLERS = ("direct", "cpg", "ppo")
+ALL_CONTROLLERS = (
+    "direct",
+    "cpg",
+    "ppo",
+    "ppo_nomorph",
+    "standstill",
+)
+
+DEFAULT_CONTROLLERS = (
+    "direct",
+    "cpg",
+    "ppo",
+    "standstill",
+)
+
+# Name written to the CSV for each controller (analyze_results.py and
+# make_figures.py use these labels).
+CONTROLLER_LABELS = {
+    "direct": "direct",
+    "cpg": "cpg",
+    "ppo": "morphology-aware",
+    "ppo_nomorph": "ppo-no-morphology",
+    "standstill": "standstill",
+}
+
+AXES = (
+    "mass",
+    "limb_length",
+    "joint_strength",
+    "friction",
+)
+
+FIELDNAMES = [
+    "controller",
+    "axis",
+    "level",
+    "episode",
+    "seed",
+    "distance",
+    "forward_distance",
+    "yaw_change",
+    "energy",
+    "reward",
+    "task_reward",
+    "fwd_vel_err",
+    "yaw_rate_err",
+    "stop_speed",
+    "steps",
+    "fallen",
+    "fall_step",
+    "recovery_time",
+]
 
 
 # ======================================================================
@@ -82,33 +151,52 @@ def params(axis, level):
         friction        -> -level
     """
 
-    p = np.ones(
-        4,
-        dtype=np.float32,
+    return morphology_params(
+        axis,
+        level,
     )
-
-    if axis == "mass":
-        p[0] = 1.0 + level
-
-    elif axis == "limb_length":
-        p[1] = 1.0 + level
-
-    elif axis == "joint_strength":
-        p[2] = 1.0 - level
-
-    elif axis == "friction":
-        p[3] = 1.0 - level
-
-    else:
-        raise ValueError(
-            f"Unknown morphology axis: {axis}"
-        )
-
-    return p
 
 
 # ======================================================================
-# EPISODE RUNNER
+# RESULT ROWS
+# ======================================================================
+
+def make_row(
+    label,
+    axis,
+    level,
+    episode,
+    seed,
+    result,
+):
+    """
+    One CSV row from the dictionary returned by run_episode().
+    """
+
+    return {
+        "controller": label,
+        "axis": axis,
+        "level": level,
+        "episode": episode,
+        "seed": seed,
+        "distance": result["distance"],
+        "forward_distance": result["forward_distance"],
+        "yaw_change": result["yaw_change"],
+        "energy": result["energy"],
+        "reward": result["reward"],
+        "task_reward": result["task_reward"],
+        "fwd_vel_err": result["fwd_vel_err"],
+        "yaw_rate_err": result["yaw_rate_err"],
+        "stop_speed": result["stop_speed"],
+        "steps": result["steps"],
+        "fallen": result["fallen"],
+        "fall_step": result["fall_step"],
+        "recovery_time": result["recovery_time"],
+    }
+
+
+# ======================================================================
+# EPISODE RUNNER (NON-LEARNING CONTROLLERS)
 # ======================================================================
 
 def run_classical(
@@ -128,165 +216,69 @@ def run_classical(
         standstill   (zero-torque reference)
     """
 
+    if name == "direct":
+        controller = DirectTrajectoryController()
+
+    elif name == "cpg":
+        controller = FixedCPGController()
+
+    elif name == "standstill":
+        controller = ZeroActionController()
+
+    else:
+        raise ValueError(
+            f"Unknown classical controller: {name}"
+        )
+
+    def policy(obs, intention, step):
+
+        return controller.act(
+            intention,
+            step,
+            obs,
+        )
+
+    # Classical controllers read only the Ant joint state, so the
+    # morphology vector is not part of their observation.
+    env = MorphologyAntEnv(
+        morphology_observation=False
+    )
+
+    morphology = params(
+        axis,
+        level,
+    )
+
     rows = []
 
-    for ep in range(episodes):
+    try:
 
-        seed = seed0 + ep
+        for ep in range(episodes):
 
-        env = MorphologyAntEnv(
-            morphology_observation=False
-        )
+            seed = seed0 + ep
 
-        morphology = params(
-            axis,
-            level,
-        )
+            controller.reset()
 
-        obs, _ = env.reset(
-            seed=seed,
-            morphology=morphology,
-            intention=0,
-        )
-
-        if name == "direct":
-            controller = DirectTrajectoryController()
-
-        elif name == "cpg":
-            controller = FixedCPGController()
-
-        elif name == "standstill":
-            controller = ZeroActionController()
-
-        else:
-            raise ValueError(
-                f"Unknown classical controller: {name}"
+            result = run_episode(
+                env,
+                policy,
+                seed=seed,
+                morphology=morphology,
+                steps=episode_steps,
             )
 
-        controller.reset()
-
-        last_info = {}
-
-        # FIXED: accumulate total episode reward (was only keeping
-        # the last step's reward).
-        total_reward = 0.0
-
-        # FIXED: snapshot distance/forward_distance/yaw_change/energy
-        # at the moment of first fall, so post-fall tumbling doesn't
-        # contaminate these metrics.
-        fall_snapshot = None
-
-        terminated = False
-        truncated = False
-
-        for step in range(
-            episode_steps
-        ):
-
-            # Fixed, noise-free intention schedule:
-            #
-            #   Forward -> Left -> Right -> Stop, 150 steps each,
-            #   repeating for the whole episode.
-            #
-            # The schedule depends only on the step index. It does NOT
-            # depend on the episode seed, and it does NOT come from
-            # the EEG decoder. Every controller receives the same
-            # schedule in every episode.
-            intention = int(
-                (step // 150) % 4
+            rows.append(
+                make_row(
+                    CONTROLLER_LABELS[name],
+                    axis,
+                    level,
+                    ep,
+                    seed,
+                    result,
+                )
             )
 
-            env.set_intention(
-                intention
-            )
-
-            action = controller.act(
-                intention,
-                step,
-                obs,
-            )
-
-            (
-                obs,
-                reward,
-                terminated,
-                truncated,
-                last_info,
-            ) = env.step(
-                action
-            )
-
-            total_reward += float(reward)
-
-            if fall_snapshot is None and last_info.get("fallen", False):
-                fall_snapshot = dict(last_info)
-
-            if terminated or truncated:
-                break
-
-        snapshot = (
-            fall_snapshot
-            if fall_snapshot is not None
-            else last_info
-        )
-
-        rows.append(
-            {
-                "controller": name,
-                "axis": axis,
-                "level": level,
-                "episode": ep,
-                "seed": seed,
-                "distance": float(
-                    snapshot.get(
-                        "distance",
-                        0.0,
-                    )
-                ),
-                "forward_distance": float(
-                    snapshot.get(
-                        "forward_distance",
-                        0.0,
-                    )
-                ),
-                "yaw_change": float(
-                    snapshot.get(
-                        "yaw_change",
-                        0.0,
-                    )
-                ),
-                "energy": float(
-                    snapshot.get(
-                        "energy",
-                        0.0,
-                    )
-                ),
-                "reward": float(
-                    total_reward
-                ),
-                "steps": int(
-                    last_info.get(
-                        "steps",
-                        step + 1,
-                    )
-                ),
-                "fallen": int(
-                    last_info.get(
-                        "fallen",
-                        0,
-                    )
-                ),
-                "fall_step": last_info.get(
-                    "fall_step",
-                    None,
-                ),
-                "recovery_time": last_info.get(
-                    "recovery_time",
-                    None,
-                ),
-            }
-        )
-
+    finally:
         env.close()
 
     return rows
@@ -303,216 +295,76 @@ def run_ppo(
     level,
     seed0,
     episode_steps,
+    morphology_observation=True,
+    label="morphology-aware",
 ):
     """
-    Evaluate the morphology-aware PPO controller.
+    Evaluate a PPO controller.
+
+    morphology_observation=True   morphology-aware policy
+                                  (113-dimensional observation)
+    morphology_observation=False  no-morphology ablation
+                                  (109-dimensional observation)
 
     Important:
-        MorphologyAntEnv already constructs the complete PPO
-        observation:
+        MorphologyAntEnv constructs the complete PPO observation:
 
             Ant state
-            + morphology
+            + morphology (only if morphology_observation)
             + intention one-hot
 
-    Therefore we DO NOT manually concatenate observation
-    components here.
+        and run_episode() refreshes it every step with the CURRENT
+        intention before the policy is queried, so the policy never
+        sees a stale intention after a schedule switch. We therefore do
+        not concatenate observation components by hand.
     """
+
+    def policy(obs, intention, step):
+
+        action, _ = model.predict(
+            obs,
+            deterministic=True,
+        )
+
+        return action
+
+    env = MorphologyAntEnv(
+        morphology_observation=morphology_observation
+    )
+
+    morphology = params(
+        axis,
+        level,
+    )
 
     rows = []
 
-    for ep in range(episodes):
+    try:
 
-        seed = seed0 + ep
+        for ep in range(episodes):
 
-        env = MorphologyAntEnv(
-            morphology_observation=True
-        )
+            seed = seed0 + ep
 
-        morphology = params(
-            axis,
-            level,
-        )
-
-        # Start each episode with Forward intention.
-        obs, _ = env.reset(
-            seed=seed,
-            morphology=morphology,
-            intention=0,
-        )
-
-        last_info = {}
-
-        # FIXED: accumulate total episode reward (was only keeping
-        # the last step's reward).
-        total_reward = 0.0
-
-        # FIXED: snapshot distance/forward_distance/yaw_change/energy
-        # at the moment of first fall, so post-fall tumbling doesn't
-        # contaminate these metrics.
-        fall_snapshot = None
-
-        terminated = False
-        truncated = False
-
-        for step in range(
-            episode_steps
-        ):
-
-            # Same fixed intention schedule used for the classical
-            # controllers (see run_classical).
-            intention = int(
-                (step // 150) % 4
+            result = run_episode(
+                env,
+                policy,
+                seed=seed,
+                morphology=morphology,
+                steps=episode_steps,
             )
 
-            env.set_intention(
-                intention
-            )
-
-            # IMPORTANT:
-            # env._obs() is not called here.
-            #
-            # The observation returned by env.step()
-            # already contains the current intention.
-            #
-            # Therefore we need to refresh the observation
-            # when intention changes before prediction.
-
-            base_obs = (
-                obs[
-                    : env.env.observation_space.shape[0]
-                ]
-            )
-
-            if env.morphology_observation:
-
-                p = env.current_params
-
-                intention_one_hot = np.zeros(
-                    4,
-                    dtype=np.float32,
+            rows.append(
+                make_row(
+                    label,
+                    axis,
+                    level,
+                    ep,
+                    seed,
+                    result,
                 )
-
-                intention_one_hot[
-                    intention
-                ] = 1.0
-
-                obs_for_policy = np.concatenate(
-                    [
-                        base_obs,
-                        p,
-                        intention_one_hot,
-                    ]
-                ).astype(
-                    np.float32
-                )
-
-            else:
-
-                intention_one_hot = np.zeros(
-                    4,
-                    dtype=np.float32,
-                )
-
-                intention_one_hot[
-                    intention
-                ] = 1.0
-
-                obs_for_policy = np.concatenate(
-                    [
-                        base_obs,
-                        intention_one_hot,
-                    ]
-                ).astype(
-                    np.float32
-                )
-
-            action, _ = model.predict(
-                obs_for_policy,
-                deterministic=True,
             )
 
-            (
-                obs,
-                reward,
-                terminated,
-                truncated,
-                last_info,
-            ) = env.step(
-                action
-            )
-
-            total_reward += float(reward)
-
-            if fall_snapshot is None and last_info.get("fallen", False):
-                fall_snapshot = dict(last_info)
-
-            if terminated or truncated:
-                break
-
-        snapshot = (
-            fall_snapshot
-            if fall_snapshot is not None
-            else last_info
-        )
-
-        rows.append(
-            {
-                "controller": "morphology-aware",
-                "axis": axis,
-                "level": level,
-                "episode": ep,
-                "seed": seed,
-                "distance": float(
-                    snapshot.get(
-                        "distance",
-                        0.0,
-                    )
-                ),
-                "forward_distance": float(
-                    snapshot.get(
-                        "forward_distance",
-                        0.0,
-                    )
-                ),
-                "yaw_change": float(
-                    snapshot.get(
-                        "yaw_change",
-                        0.0,
-                    )
-                ),
-                "energy": float(
-                    snapshot.get(
-                        "energy",
-                        0.0,
-                    )
-                ),
-                "reward": float(
-                    total_reward
-                ),
-                "steps": int(
-                    last_info.get(
-                        "steps",
-                        step + 1,
-                    )
-                ),
-                "fallen": int(
-                    last_info.get(
-                        "fallen",
-                        0,
-                    )
-                ),
-                "fall_step": last_info.get(
-                    "fall_step",
-                    None,
-                ),
-                "recovery_time": last_info.get(
-                    "recovery_time",
-                    None,
-                ),
-            }
-        )
-
+    finally:
         env.close()
 
     return rows
@@ -536,23 +388,6 @@ def save_results(
             exist_ok=True,
         )
 
-    fieldnames = [
-        "controller",
-        "axis",
-        "level",
-        "episode",
-        "seed",
-        "distance",
-        "forward_distance",
-        "yaw_change",
-        "energy",
-        "reward",
-        "steps",
-        "fallen",
-        "fall_step",
-        "recovery_time",
-    ]
-
     with open(
         output_path,
         "w",
@@ -561,7 +396,7 @@ def save_results(
 
         writer = csv.DictWriter(
             f,
-            fieldnames=fieldnames,
+            fieldnames=FIELDNAMES,
         )
 
         writer.writeheader()
@@ -617,15 +452,31 @@ def main():
         default=list(DEFAULT_CONTROLLERS),
         help=(
             "Which controllers to run. Default: direct cpg ppo "
-            "(the original three). Add 'standstill' for the "
-            "zero-torque reference."
+            "standstill. Add 'ppo_nomorph' for the "
+            "no-morphology ablation."
         ),
     )
 
     parser.add_argument(
         "--model",
         default="models/morphology_ant_ppo.zip",
-        help="Path to trained PPO model (only needed for 'ppo').",
+        help="Path to trained morphology-aware PPO model "
+        "(only needed for 'ppo').",
+    )
+
+    parser.add_argument(
+        "--model-nomorph",
+        default=None,
+        help="Path to the trained no-morphology PPO model "
+        "(only needed for 'ppo_nomorph').",
+    )
+
+    parser.add_argument(
+        "--seed0",
+        type=int,
+        default=1000,
+        help="First initial-state seed. The SAME seeds are used for "
+        "every controller, so episodes are paired.",
     )
 
     parser.add_argument(
@@ -637,18 +488,22 @@ def main():
     args = parser.parse_args()
 
     # --------------------------------------------------------------
-    # Load PPO (only if it will be used)
+    # Check and load PPO models (only the ones that will be used)
     # --------------------------------------------------------------
 
-    model = None
+    models = {}
 
-    if "ppo" in args.controllers:
+    for name, path in (
+        ("ppo", args.model),
+        ("ppo_nomorph", args.model_nomorph),
+    ):
 
-        if not os.path.exists(
-            args.model
-        ):
+        if name not in args.controllers:
+            continue
+
+        if path is None or not os.path.exists(path):
             raise FileNotFoundError(
-                f"PPO model not found: {args.model}"
+                f"PPO model not found for '{name}': {path}"
             )
 
     print()
@@ -665,6 +520,11 @@ def main():
             f"PPO model   : {args.model}"
         )
 
+    if "ppo_nomorph" in args.controllers:
+        print(
+            f"No-morph PPO: {args.model_nomorph}"
+        )
+
     print(
         f"Episodes    : {args.episodes}"
     )
@@ -675,30 +535,37 @@ def main():
         f"Levels      : {args.levels}"
     )
     print(
+        f"Seeds       : {args.seed0}.."
+        f"{args.seed0 + args.episodes - 1} "
+        "(shared by all controllers)"
+    )
+    print(
         f"Output      : {args.output}"
     )
     print()
 
-    if "ppo" in args.controllers:
+    # Import Stable-Baselines3 only when a PPO controller is run.
+    if "ppo" in args.controllers or "ppo_nomorph" in args.controllers:
 
-        model = PPO.load(
-            args.model
-        )
+        from stable_baselines3 import PPO
+
+        if "ppo" in args.controllers:
+            models["ppo"] = PPO.load(
+                args.model
+            )
+
+        if "ppo_nomorph" in args.controllers:
+            models["ppo_nomorph"] = PPO.load(
+                args.model_nomorph
+            )
 
     rows = []
-
-    axes = [
-        "mass",
-        "limb_length",
-        "joint_strength",
-        "friction",
-    ]
 
     # --------------------------------------------------------------
     # Run experiment
     # --------------------------------------------------------------
 
-    for axis in axes:
+    for axis in AXES:
 
         for level in args.levels:
 
@@ -707,92 +574,54 @@ def main():
                 f"{level:.0%}"
             )
 
-            # ------------------------------------------------------
-            # Direct baseline
-            # ------------------------------------------------------
-
-            if "direct" in args.controllers:
+            for name in args.controllers:
 
                 print(
-                    "  Running Direct..."
+                    f"  Running {name}..."
                 )
 
-                rows.extend(
-                    run_classical(
-                        name="direct",
-                        episodes=args.episodes,
-                        axis=axis,
-                        level=level,
-                        seed0=1000,
-                        episode_steps=args.steps,
+                if name in ("direct", "cpg", "standstill"):
+
+                    rows.extend(
+                        run_classical(
+                            name=name,
+                            episodes=args.episodes,
+                            axis=axis,
+                            level=level,
+                            seed0=args.seed0,
+                            episode_steps=args.steps,
+                        )
                     )
-                )
 
-            # ------------------------------------------------------
-            # Fixed CPG baseline
-            # ------------------------------------------------------
+                elif name == "ppo":
 
-            if "cpg" in args.controllers:
-
-                print(
-                    "  Running CPG..."
-                )
-
-                rows.extend(
-                    run_classical(
-                        name="cpg",
-                        episodes=args.episodes,
-                        axis=axis,
-                        level=level,
-                        seed0=2000,
-                        episode_steps=args.steps,
+                    rows.extend(
+                        run_ppo(
+                            model=models["ppo"],
+                            episodes=args.episodes,
+                            axis=axis,
+                            level=level,
+                            seed0=args.seed0,
+                            episode_steps=args.steps,
+                            morphology_observation=True,
+                            label=CONTROLLER_LABELS["ppo"],
+                        )
                     )
-                )
 
-            # ------------------------------------------------------
-            # Morphology-aware PPO
-            # ------------------------------------------------------
+                elif name == "ppo_nomorph":
 
-            if "ppo" in args.controllers:
-
-                print(
-                    "  Running morphology-aware PPO..."
-                )
-
-                rows.extend(
-                    run_ppo(
-                        model=model,
-                        episodes=args.episodes,
-                        axis=axis,
-                        level=level,
-                        seed0=3000,
-                        episode_steps=args.steps,
+                    rows.extend(
+                        run_ppo(
+                            model=models["ppo_nomorph"],
+                            episodes=args.episodes,
+                            axis=axis,
+                            level=level,
+                            seed0=args.seed0,
+                            episode_steps=args.steps,
+                            morphology_observation=False,
+                            label=CONTROLLER_LABELS["ppo_nomorph"],
+                        )
                     )
-                )
-
-            # ------------------------------------------------------
-            # Stand-still reference (zero torque)
-            #
-            # Uses seed block 1000-1009, the same block as Direct, so
-            # the two start from identical initial states.
-            # ------------------------------------------------------
-
-            if "standstill" in args.controllers:
-
-                print(
-                    "  Running stand-still reference..."
-                )
-
-                rows.extend(
-                    run_classical(
-                        name="standstill",
-                        episodes=args.episodes,
-                        axis=axis,
-                        level=level,
-                        seed0=1000,
-                        episode_steps=args.steps,
-                    )
-                )
 
     # --------------------------------------------------------------
     # Save

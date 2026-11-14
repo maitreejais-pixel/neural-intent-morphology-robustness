@@ -4,19 +4,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# Defaults reproduce the original behavior exactly (same input file,
-# same output folder). To analyze a results file that also contains the
-# stand-still reference WITHOUT overwriting the existing summary and
-# plots, pass --input and --outdir, e.g.:
+# Defaults reproduce the original behavior (same input file, same
+# output folder). To analyze another results file WITHOUT overwriting
+# the existing summary and plots, pass --input and --outdir, e.g.:
 #
 #   python scripts/analyze_results.py \
-#       --input results/physics_results_with_standstill.csv \
-#       --outdir results_with_standstill
+#       --input results/physics_results_run2.csv \
+#       --outdir results_run2
 #
 DEFAULT_INPUT = os.path.join("results", "physics_results.csv")
 DEFAULT_OUTDIR = "results"
 
 
+# ---------------------------------------------------------------------
+# HISTORY (kept from the earlier versions of this script)
+# ---------------------------------------------------------------------
+#
 # FIXED: this script previously used DISTANCE (raw net displacement)
 # as the primary "retained performance" metric and as the sole basis
 # for "best_controller_by_condition". That metric has a real flaw for
@@ -27,31 +30,51 @@ DEFAULT_OUTDIR = "results"
 # simply keeps walking forward the whole episode will rack up MORE
 # net distance than one that correctly stops and turns as
 # instructed -- so "distance" can reward *ignoring* the task.
-#
-# Concretely: at limb_length=0.5, PPO's distance-based "retained"
-# figure was 468% (looks like a huge improvement under perturbation),
-# but its reward_mean there was 378.58 -- actually WORSE than
-# Direct's 617.25 at the same condition. The reward the environment
-# already computes (env.py's _intention_reward, which is
-# intention-specific: tracks commanded forward speed during Forward,
-# commanded yaw during Left/Right, stillness during Stop, plus an
-# uprightness bonus and a per-step fall penalty) does NOT have this
-# blind spot, and it is already logged in the "reward" column of
-# every episode. This script now treats REWARD as the primary
-# performance metric, with distance and fall rate kept as supporting,
+# Distance and fall rate are therefore kept only as supporting,
 # clearly-labeled context rather than the headline number.
 #
 # ADDED: if the results file contains a "standstill" controller (zero
-# torque at every step), the summary gains two columns,
-# standstill_reward_mean and reward_minus_standstill, and a table
-# comparing every controller to the stand-still reference is printed.
-# This calibrates the reward: a policy that does nothing scores about
-# 672 at nominal morphology, so a high reward alone does not show that
-# a controller is locomoting or following commands.
-# "Best controller by condition" is still ranked among the real
-# controllers only (the stand-still reference is excluded from it).
+# torque at every step), the summary gains standstill_* columns and a
+# table comparing every controller to the stand-still reference is
+# printed. This calibrates the reward: a policy that does nothing must
+# not score as well as one that follows the commands.
+# "Best controller by condition" is ranked among the real controllers
+# only (the stand-still reference is excluded from it).
+#
+# ---------------------------------------------------------------------
+# CHANGES IN THIS VERSION
+# ---------------------------------------------------------------------
+#
+# The environment reward changed (src/env.py): tracking terms are now
+# baseline-subtracted, so a robot that does not move earns 0 on the
+# Forward / Left / Right tracking terms. The results CSV therefore has
+# new columns, and this script uses them when they are present:
+#
+#   task_reward     tracking reward only (no uprightness bonus, no
+#                   control cost). A stand-still robot scores only
+#                   about 150 here (the Stop segments), so this is the
+#                   PRIMARY metric now.
+#   fwd_vel_err     mean |forward speed - target| in Forward segments
+#   yaw_rate_err    mean |yaw rate - target| in Left/Right segments
+#   stop_speed      mean residual speed in Stop segments
+#
+# "reward" (total episode reward) is kept for continuity: it still
+# includes the uprightness bonus, which is a constant for any policy
+# that stays upright and does not separate controllers.
+#
+# Everything that was in the old summary is still written. Old results
+# files without the new columns still work (the new columns are simply
+# skipped).
 
 REFERENCE_CONTROLLER = "standstill"
+
+# Below this nominal distance (metres) a "retained distance" percentage
+# is meaningless (it would explode), so it is set to NaN. NOTE: the
+# stand-still robot is NOT necessarily below this threshold -- it
+# settles and drifts a few tens of centimetres -- so its distance
+# percentage can still be large; that is exactly why distance is
+# reference-only (see the history note at the top of this script).
+MIN_NOMINAL_DISTANCE = 0.05
 
 
 def main():
@@ -127,6 +150,26 @@ def main():
         f"{sorted(df['level'].unique().tolist())}"
     )
 
+    has_task_reward = "task_reward" in df.columns
+
+    if has_task_reward:
+        print(
+            "Task-reward columns found: task_reward is the "
+            "primary metric."
+        )
+    else:
+        print(
+            "No task_reward column (older results file): "
+            "reward is the primary metric."
+        )
+
+    # The primary metric: task_reward when available, else reward.
+    PRIMARY = (
+        "task_reward_mean"
+        if has_task_reward
+        else "reward_mean"
+    )
+
     # ---------------------------------------------------------
     # Handle fall column
     # ---------------------------------------------------------
@@ -165,17 +208,23 @@ def main():
         )
 
     # ---------------------------------------------------------
-    # Nominal performance (level == 0), for BOTH distance and reward
+    # Nominal performance (level == 0)
     # ---------------------------------------------------------
+
+    nominal_columns = ["distance", "reward"]
+
+    if has_task_reward:
+        nominal_columns.append("task_reward")
 
     nominal = (
         df[df["level"] == 0]
-        .groupby("controller")[["distance", "reward"]]
+        .groupby("controller")[nominal_columns]
         .mean()
         .rename(
             columns={
                 "distance": "nominal_distance",
                 "reward": "nominal_reward",
+                "task_reward": "nominal_task_reward",
             }
         )
     )
@@ -185,7 +234,15 @@ def main():
         on="controller",
     )
 
-    if df["nominal_distance"].isna().any() or df["nominal_reward"].isna().any():
+    required_nominal = [
+        "nominal_distance",
+        "nominal_reward",
+    ]
+
+    if has_task_reward:
+        required_nominal.append("nominal_task_reward")
+
+    if df[required_nominal].isna().any().any():
         raise ValueError(
             "Some controllers do not have nominal "
             "level=0 results."
@@ -194,31 +251,30 @@ def main():
     # ---------------------------------------------------------
     # Retained distance (kept for reference -- see caveat above)
     #
-    # Note: for the stand-still reference, nominal distance is close
-    # to zero, so this percentage is not meaningful for it.
+    # Note: this percentage is not meaningful for a controller whose
+    # nominal distance is (near) zero, and it is set to NaN below
+    # MIN_NOMINAL_DISTANCE. It is also not meaningful for the
+    # stand-still reference, which can show a large "retained
+    # distance" from settling/drift alone.
     # ---------------------------------------------------------
 
     df["retained_percent"] = (
         100.0
         * df["distance"]
         / df["nominal_distance"]
+    ).where(
+        df["nominal_distance"] >= MIN_NOMINAL_DISTANCE
     )
 
     # ---------------------------------------------------------
-    # FIXED: retained REWARD -- the primary robustness metric.
+    # Retained REWARD (total reward and task reward).
     #
-    # Unlike retained_percent (distance-based), this cannot be
-    # inflated by a controller that ignores commanded turns/stops and
-    # just walks in one direction, because the reward itself already
-    # penalizes not following the current intention.
-    #
-    # Nominal reward can be negative (e.g. CPG falls even at 0%
-    # perturbation in this run), which makes a simple percentage
-    # misleading (a very negative nominal reward makes any less-bad
-    # reward look like a huge positive "improvement"). We therefore
-    # only compute reward_retained_percent when nominal_reward is
-    # positive, and report the raw reward difference alongside it in
-    # all cases so the numbers are never silently misleading.
+    # Nominal reward can be negative or near zero (e.g. CPG falls even
+    # at 0% perturbation), which makes a simple percentage misleading.
+    # We therefore only compute the retained percentage when the
+    # nominal value is positive, and report the raw difference
+    # alongside it in all cases so the numbers are never silently
+    # misleading.
     # ---------------------------------------------------------
 
     df["reward_retained_percent"] = df.apply(
@@ -234,8 +290,27 @@ def main():
         df["reward"] - df["nominal_reward"]
     )
 
+    if has_task_reward:
+
+        df["task_reward_retained_percent"] = df.apply(
+            lambda row: (
+                100.0
+                * row["task_reward"]
+                / row["nominal_task_reward"]
+                if row["nominal_task_reward"] > 0
+                else float("nan")
+            ),
+            axis=1,
+        )
+
+        df["task_reward_delta_from_nominal"] = (
+            df["task_reward"] - df["nominal_task_reward"]
+        )
+
     # ---------------------------------------------------------
     # Recovery time
+    # (always empty in the current environment, because episodes end
+    # at the first fall; kept so older results files still work)
     # ---------------------------------------------------------
 
     if "recovery_time" in df.columns:
@@ -251,6 +326,7 @@ def main():
     # ---------------------------------------------------------
 
     aggregations = {
+        "n_episodes": ("reward", "size"),
         "distance_mean": ("distance", "mean"),
         "distance_sd": ("distance", "std"),
         "retained_mean": ("retained_percent", "mean"),
@@ -262,6 +338,26 @@ def main():
         "fall_rate": ("fall_numeric", "mean"),
         "energy_mean": ("energy", "mean"),
     }
+
+    if has_task_reward:
+        aggregations["task_reward_mean"] = ("task_reward", "mean")
+        aggregations["task_reward_sd"] = ("task_reward", "std")
+        aggregations["task_reward_retained_mean"] = (
+            "task_reward_retained_percent",
+            "mean",
+        )
+        aggregations["task_reward_delta_mean"] = (
+            "task_reward_delta_from_nominal",
+            "mean",
+        )
+
+    for column, name in (
+        ("fwd_vel_err", "fwd_vel_err_mean"),
+        ("yaw_rate_err", "yaw_rate_err_mean"),
+        ("stop_speed", "stop_speed_mean"),
+    ):
+        if column in df.columns:
+            aggregations[name] = (column, "mean")
 
     if "forward_distance" in df.columns:
         aggregations["forward_distance_mean"] = (
@@ -306,15 +402,25 @@ def main():
 
     if has_reference:
 
+        reference_columns = ["axis", "level", "reward_mean"]
+
+        reference_rename = {
+            "reward_mean": "standstill_reward_mean",
+        }
+
+        if has_task_reward:
+            reference_columns.append("task_reward_mean")
+            reference_rename["task_reward_mean"] = (
+                "standstill_task_reward_mean"
+            )
+
         reference = (
             summary[
                 summary["controller"]
                 == REFERENCE_CONTROLLER
-            ][["axis", "level", "reward_mean"]]
+            ][reference_columns]
             .rename(
-                columns={
-                    "reward_mean": "standstill_reward_mean",
-                }
+                columns=reference_rename
             )
         )
 
@@ -328,6 +434,12 @@ def main():
             summary["reward_mean"]
             - summary["standstill_reward_mean"]
         )
+
+        if has_task_reward:
+            summary["task_minus_standstill"] = (
+                summary["task_reward_mean"]
+                - summary["standstill_task_reward_mean"]
+            )
 
     # ---------------------------------------------------------
     # Save summary
@@ -347,12 +459,12 @@ def main():
     print("SUMMARY")
     print("=" * 90)
     print(
-        "NOTE: reward_mean / reward_retained_mean is the primary "
-        "robustness comparison. distance_mean / retained_mean is kept "
-        "for reference only -- it can look artificially good for a "
-        "controller that ignores the Left/Right/Stop commands and "
-        "just keeps walking forward, since raw net displacement does "
-        "not penalize that. See the note at the top of this script."
+        f"NOTE: {PRIMARY} is the primary robustness comparison. "
+        "distance_mean / retained_mean is kept for reference only -- "
+        "it can look artificially good for a controller that ignores "
+        "the Left/Right/Stop commands and just keeps walking forward, "
+        "since raw net displacement does not penalize that. See the "
+        "note at the top of this script."
     )
     print()
 
@@ -360,10 +472,16 @@ def main():
 
     if has_reference:
 
+        comparison_column = (
+            "task_minus_standstill"
+            if has_task_reward
+            else "reward_minus_standstill"
+        )
+
         print()
         print("=" * 90)
         print(
-            "REWARD MINUS STAND-STILL REFERENCE "
+            f"{comparison_column.upper()} "
             "(negative = scores below a do-nothing policy)"
         )
         print("=" * 90)
@@ -376,14 +494,28 @@ def main():
             .pivot_table(
                 index=["axis", "level"],
                 columns="controller",
-                values="reward_minus_standstill",
+                values=comparison_column,
             )
             .reset_index()
         )
 
         print(comparison.to_string(index=False))
 
-        comparison.to_csv(
+        # Both comparison tables are saved when available.
+        reward_comparison = (
+            summary[
+                summary["controller"]
+                != REFERENCE_CONTROLLER
+            ]
+            .pivot_table(
+                index=["axis", "level"],
+                columns="controller",
+                values="reward_minus_standstill",
+            )
+            .reset_index()
+        )
+
+        reward_comparison.to_csv(
             os.path.join(
                 RESULTS_DIR,
                 "reward_minus_standstill.csv",
@@ -391,19 +523,45 @@ def main():
             index=False,
         )
 
+        if has_task_reward:
+
+            comparison.to_csv(
+                os.path.join(
+                    RESULTS_DIR,
+                    "task_minus_standstill.csv",
+                ),
+                index=False,
+            )
+
     # ---------------------------------------------------------
     # Controller-level nominal performance
     # ---------------------------------------------------------
 
+    nominal_aggregations = {
+        "nominal_distance": ("distance", "mean"),
+        "nominal_reward": ("reward", "mean"),
+        "nominal_energy": ("energy", "mean"),
+        "nominal_fall_rate": ("fall_numeric", "mean"),
+    }
+
+    if has_task_reward:
+        nominal_aggregations["nominal_task_reward"] = (
+            "task_reward",
+            "mean",
+        )
+
+    for column, name in (
+        ("fwd_vel_err", "nominal_fwd_vel_err"),
+        ("yaw_rate_err", "nominal_yaw_rate_err"),
+        ("stop_speed", "nominal_stop_speed"),
+    ):
+        if column in df.columns:
+            nominal_aggregations[name] = (column, "mean")
+
     nominal_summary = (
         df[df["level"] == 0]
         .groupby("controller")
-        .agg(
-            nominal_distance=("distance", "mean"),
-            nominal_reward=("reward", "mean"),
-            nominal_energy=("energy", "mean"),
-            nominal_fall_rate=("fall_numeric", "mean"),
-        )
+        .agg(**nominal_aggregations)
         .reset_index()
     )
 
@@ -416,10 +574,16 @@ def main():
         index=False,
     )
 
+    print()
+    print("=" * 90)
+    print("NOMINAL SUMMARY")
+    print("=" * 90)
+    print(nominal_summary.to_string(index=False))
+
     # ---------------------------------------------------------
-    # Robustness plots -- now one for distance (reference) and one
-    # for reward (primary), per axis, plus the existing fall-rate
-    # plots.
+    # Robustness plots -- per axis: task reward (primary, when
+    # available), total reward, and distance (reference only), plus
+    # the fall-rate plots below.
     # ---------------------------------------------------------
 
     controllers = summary["controller"].dropna().unique()
@@ -427,7 +591,38 @@ def main():
 
     for axis in axes:
 
-        # --- Reward-based robustness (primary) ---
+        # --- Task-reward robustness (primary) ---
+        if has_task_reward:
+
+            plt.figure(figsize=(7, 5))
+            for controller in controllers:
+                d = summary[
+                    (summary["axis"] == axis)
+                    & (summary["controller"] == controller)
+                ].sort_values("level")
+                plt.plot(
+                    d["level"] * 100.0,
+                    d["task_reward_mean"],
+                    marker="o",
+                    label=controller,
+                )
+            plt.xlabel("Perturbation (%)")
+            plt.ylabel("Mean task reward")
+            plt.title(
+                f"Task reward vs {axis.replace('_', ' ')} "
+                "perturbation (primary metric)"
+            )
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+            output = os.path.join(
+                RESULTS_DIR, f"{axis}_task_reward.png"
+            )
+            plt.savefig(output, dpi=200, bbox_inches="tight")
+            plt.close()
+            print(f"Saved {output}")
+
+        # --- Total-reward robustness ---
         plt.figure(figsize=(7, 5))
         for controller in controllers:
             d = summary[
@@ -443,8 +638,12 @@ def main():
         plt.xlabel("Perturbation (%)")
         plt.ylabel("Mean episode reward")
         plt.title(
-            f"Reward vs {axis.replace('_', ' ')} perturbation "
-            "(primary robustness metric)"
+            f"Reward vs {axis.replace('_', ' ')} perturbation"
+            + (
+                ""
+                if has_task_reward
+                else " (primary robustness metric)"
+            )
         )
         plt.legend()
         plt.grid(alpha=0.3)
@@ -513,14 +712,14 @@ def main():
         print(f"Saved {output}")
 
     # ---------------------------------------------------------
-    # Final endpoint comparison -- sorted by REWARD now, not distance
+    # Final endpoint comparison -- sorted by the PRIMARY metric
     # ---------------------------------------------------------
 
     endpoint = (
         summary[summary["level"] == 0.5]
         .copy()
         .sort_values(
-            ["axis", "reward_mean"],
+            ["axis", PRIMARY],
             ascending=[True, False],
         )
     )
@@ -532,16 +731,18 @@ def main():
 
     print()
     print("=" * 90)
-    print("50% PERTURBATION ENDPOINT (sorted by reward_mean, primary metric)")
+    print(
+        f"50% PERTURBATION ENDPOINT (sorted by {PRIMARY}, "
+        "primary metric)"
+    )
     print("=" * 90)
     print(endpoint.to_string(index=False))
 
     # ---------------------------------------------------------
-    # Best controller at each perturbation -- FIXED: now ranked by
-    # reward_mean, not distance-based retained_mean. The stand-still
-    # reference is a calibration baseline, not a candidate controller,
-    # so it is excluded from this ranking (its reward is reported
-    # alongside instead).
+    # Best controller at each perturbation -- ranked by the PRIMARY
+    # metric. The stand-still reference is a calibration baseline, not
+    # a candidate controller, so it is excluded from this ranking (its
+    # value is reported alongside instead).
     # ---------------------------------------------------------
 
     best_rows = []
@@ -558,11 +759,12 @@ def main():
             ]
             if len(d) == 0:
                 continue
-            best = d.loc[d["reward_mean"].idxmax()]
+            best = d.loc[d[PRIMARY].idxmax()]
             row = {
                 "axis": axis,
                 "level": level,
                 "best_controller": best["controller"],
+                PRIMARY: best[PRIMARY],
                 "reward_mean": best["reward_mean"],
                 "retained_percent_distance_reference": best[
                     "retained_mean"
@@ -573,6 +775,10 @@ def main():
                 row["standstill_reward_mean"] = best[
                     "standstill_reward_mean"
                 ]
+                if has_task_reward:
+                    row["standstill_task_reward_mean"] = best[
+                        "standstill_task_reward_mean"
+                    ]
             best_rows.append(row)
 
     best_df = pd.DataFrame(best_rows)
@@ -585,7 +791,7 @@ def main():
     print()
     print("=" * 90)
     print(
-        "BEST CONTROLLER BY CONDITION (ranked by reward_mean, "
+        f"BEST CONTROLLER BY CONDITION (ranked by {PRIMARY}, "
         "stand-still reference excluded)"
     )
     print("=" * 90)

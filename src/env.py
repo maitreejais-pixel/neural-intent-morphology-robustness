@@ -62,6 +62,53 @@ class MorphologyAntEnv(gym.Wrapper):
 
     (Previously these were swapped; see LEFT_YAW_TARGET /
     RIGHT_YAW_TARGET below.)
+
+    CHANGES IN THIS VERSION (everything else is unchanged)
+    ------------------------------------------------------
+    1. REWARD: the tracking terms are now baseline-subtracted
+       (_normalized_tracking). A robot that does not move earns 0 on the
+       Forward / Left / Right tracking terms instead of a large positive
+       constant (about 0.2-0.3 per step), so a zero-torque policy no
+       longer outscores a controller that actually follows the command.
+       The Stop reward is unchanged (stillness is what Stop asks for).
+       The per-step task part of the reward (without the uprightness
+       bonus and the control cost) is logged as info["task_reward"].
+
+    2. LIMB LENGTH: the previous version looked up bodies called
+       "left_leg", "right_leg" and "rightback_leg", which do not exist
+       in Ant-v5 (they are geom names), and the unnamed ankle bodies
+       were never scaled at all. Now EVERY body below the torso has its
+       position and inertial offset scaled, capsule centres and
+       half-lengths are scaled, bounding radii/boxes are updated, and
+       mj_setConst is called. Capsule radius is unchanged.
+
+    3. MASS: body inertia now scales together with body mass.
+
+    4. A missing limb geom now raises an error instead of being skipped
+       silently.
+
+    6. FORWARD PENALTY WEIGHTS lowered to yaw 0.30 / lateral 0.20 (were
+       1.75 / 0.50): with the old weights the instantaneous yaw-rate
+       penalty outweighed the forward-tracking reward for any gait that
+       wobbles, so a walking policy scored below standing still (see
+       the note next to the weights). The constructor options
+       forward_yaw_weight, forward_lateral_weight (override the
+       weights) and penalty_tau (smooth the penalties) are kept; all
+       default to None. NOTE: this changes the Forward reward, so every
+       model, tuning result and experiment run before this change is
+       obsolete.
+
+    5. START POSE (start_in_joint_range=True, the default): Ant-v5 starts
+       every ankle at about 0 degrees although its allowed range is
+       30..70 degrees (or -30..-70). The joint limits therefore snap all
+       four legs to their limits in the first steps. With limbs +30% to
+       +50% longer the snap drives the feet into the floor and LAUNCHES
+       the robot about 1 m into the air; it then tumbles and is scored
+       as a fall (5 of 20 zero-torque episodes at +50% limb length), a
+       start-up artifact rather than a loss of balance. Every limited
+       joint is now clipped into its range (and its velocity zeroed)
+       right after reset, which removes the artifact (0 of 20). Pass
+       start_in_joint_range=False to reproduce the old behaviour.
     """
 
     ACTION_DIM = 8
@@ -75,7 +122,7 @@ class MorphologyAntEnv(gym.Wrapper):
     }
 
     # ------------------------------------------------------------------
-    # Ant-v5 limb geometry names
+    # Ant-v5 limb geometry names (all capsules)
     # ------------------------------------------------------------------
 
     LIMB_GEOMS = (
@@ -93,17 +140,13 @@ class MorphologyAntEnv(gym.Wrapper):
         "fourth_ankle_geom",
     )
 
-    # Bodies whose local position determines the limb-chain geometry.
-    LIMB_BODIES = (
-        "aux_1",
-        "left_leg",
-        "aux_2",
-        "right_leg",
-        "aux_3",
-        "back_leg",
-        "aux_4",
-        "rightback_leg",
-    )
+    # NOTE: there is intentionally no LIMB_BODIES name list any more.
+    # In Ant-v5 the leg chain bodies are front_left_leg / aux_1 /
+    # (unnamed ankle), front_right_leg / aux_2 / (unnamed ankle),
+    # back_leg / aux_3 / (unnamed ankle), right_back_leg / aux_4 /
+    # (unnamed ankle). Because the ankle bodies have no name, the limb
+    # bodies are taken to be every body below the torso (body ids >= 2;
+    # id 0 is the world and id 1 is the torso). See __init__.
 
     # ------------------------------------------------------------------
     # Reward parameters
@@ -121,7 +164,7 @@ class MorphologyAntEnv(gym.Wrapper):
 
     # Reward scales.
     FORWARD_TRACK_WEIGHT = 1.50
-    FORWARD_LATERAL_WEIGHT = 0.50
+    FORWARD_LATERAL_WEIGHT = 0.20  # was 0.50 (see note below)
 
     # FIXED: yaw_velocity is the only quantity affected by the dt bug
     # fixed in _step_dt() below (it used to be computed by dividing a
@@ -151,7 +194,7 @@ class MorphologyAntEnv(gym.Wrapper):
     # harder to satisfy (comparing against a true ~0.8 rad/s goal
     # instead of an accidentally-easy inflated one) without needing a
     # separate weight change.
-    FORWARD_YAW_WEIGHT = 1.75  # was 0.35
+    FORWARD_YAW_WEIGHT = 0.30  # was 1.75 (see note below)
 
     TURN_YAW_WEIGHT = 1.50
     TURN_FORWARD_WEIGHT = 0.20
@@ -159,6 +202,22 @@ class MorphologyAntEnv(gym.Wrapper):
 
     STOP_LINEAR_WEIGHT = 1.20
     STOP_YAW_WEIGHT = 4.00  # was 0.80
+
+    # NOTE ON THE FORWARD PENALTY WEIGHTS (0.30 / 0.20)
+    # --------------------------------------------------
+    # The weights were 1.75 (yaw) and 0.50 (lateral). 1.75 was not an
+    # arbitrary choice: it equals the original 0.35 times the 5x yaw
+    # inflation of the old dt bug, i.e. the strength the penalty always
+    # had per true rad/s. That strength is too high for a walking gait:
+    # in Forward-only PPO tests (1M steps) policies that moved forward at
+    # 0.27-0.33 m/s collected about +0.2 per step of forward tracking but
+    # -0.8 per step of yaw-rate penalty (mean |yaw rate| only 0.45 rad/s,
+    # ordinary gait wobble), so they scored below standing still and
+    # fell within about 3 s. With weights 0.30 / 0.20 the same setup
+    # learned to walk (0.96 m/s, 10% falls, +0.24 reward per step).
+    # Smoothing the penalties alone (penalty_tau) did not fix it.
+    # The options forward_yaw_weight / forward_lateral_weight remain as
+    # constructor overrides.
 
     # Stability reward.
     UPRIGHT_WEIGHT = 0.30
@@ -188,6 +247,10 @@ class MorphologyAntEnv(gym.Wrapper):
         render_mode=None,
         morphology_observation=True,
         terminate_when_unhealthy=False,
+        start_in_joint_range=True,
+        forward_yaw_weight=None,
+        forward_lateral_weight=None,
+        penalty_tau=None,
     ):
         env = gym.make(
             "Ant-v5",
@@ -204,6 +267,40 @@ class MorphologyAntEnv(gym.Wrapper):
         self.morphology_observation = bool(
             morphology_observation
         )
+
+        self.start_in_joint_range = bool(
+            start_in_joint_range
+        )
+
+        # Optional shaping of the FORWARD penalties (None = defaults).
+        #
+        # forward_yaw_weight / forward_lateral_weight override
+        # FORWARD_YAW_WEIGHT / FORWARD_LATERAL_WEIGHT.
+        #
+        # penalty_tau (seconds) smooths the yaw rate and the lateral
+        # speed with an exponential moving average BEFORE they are
+        # penalized in the Forward reward, so ordinary gait wobble
+        # averages out and only net turning / net sideways drift is
+        # punished. None = penalize the instantaneous values (the
+        # original behaviour).
+        if forward_yaw_weight is not None:
+            self.FORWARD_YAW_WEIGHT = float(forward_yaw_weight)
+
+        if forward_lateral_weight is not None:
+            self.FORWARD_LATERAL_WEIGHT = float(
+                forward_lateral_weight
+            )
+
+        self.penalty_tau = (
+            None if penalty_tau is None else float(penalty_tau)
+        )
+
+        self._yaw_ema = 0.0
+        self._lat_ema = 0.0
+
+        # (tracking, lateral term, yaw term) of the latest Forward
+        # reward; zeros for the other intentions.
+        self._last_forward_terms = (0.0, 0.0, 0.0)
 
         # --------------------------------------------------------------
         # Build the actual observation space.
@@ -309,6 +406,9 @@ class MorphologyAntEnv(gym.Wrapper):
 
         self.step_count = 0
 
+        # Task part of the most recent reward (set by _intention_reward).
+        self._last_task_reward = 0.0
+
         # Most recent original Ant-v5 observation.
         self._last_base_obs = None
 
@@ -320,6 +420,10 @@ class MorphologyAntEnv(gym.Wrapper):
 
         self.nominal_body_mass = (
             model.body_mass.copy()
+        )
+
+        self.nominal_body_inertia = (
+            model.body_inertia.copy()
         )
 
         self.nominal_actuator_gear = (
@@ -334,8 +438,24 @@ class MorphologyAntEnv(gym.Wrapper):
             model.geom_size.copy()
         )
 
+        self.nominal_geom_pos = (
+            model.geom_pos.copy()
+        )
+
+        self.nominal_geom_rbound = (
+            model.geom_rbound.copy()
+        )
+
+        self.nominal_geom_aabb = (
+            model.geom_aabb.copy()
+        )
+
         self.nominal_body_pos = (
             model.body_pos.copy()
+        )
+
+        self.nominal_body_ipos = (
+            model.body_ipos.copy()
         )
 
         # --------------------------------------------------------------
@@ -344,50 +464,57 @@ class MorphologyAntEnv(gym.Wrapper):
 
         self.limb_geom_ids = []
 
+        missing_geoms = []
+
         for name in self.LIMB_GEOMS:
-            try:
-                gid = mujoco.mj_name2id(
-                    model,
-                    mujoco.mjtObj.mjOBJ_GEOM,
-                    name,
-                )
 
-                if gid >= 0:
-                    self.limb_geom_ids.append(
-                        gid
-                    )
-
-            except Exception:
-                pass
-
-        self.limb_body_ids = []
-
-        for name in self.LIMB_BODIES:
-            try:
-                bid = mujoco.mj_name2id(
-                    model,
-                    mujoco.mjtObj.mjOBJ_BODY,
-                    name,
-                )
-
-                if bid >= 0:
-                    self.limb_body_ids.append(
-                        bid
-                    )
-
-            except Exception:
-                pass
-
-        if len(self.limb_geom_ids) == 0:
-            raise RuntimeError(
-                "No Ant limb geometries were found. "
-                "Check the Ant-v5 geometry names."
+            gid = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                name,
             )
+
+            if gid >= 0:
+                self.limb_geom_ids.append(
+                    gid
+                )
+            else:
+                missing_geoms.append(
+                    name
+                )
+
+        if len(missing_geoms) > 0:
+            raise RuntimeError(
+                "Ant-v5 limb geometries not found: "
+                f"{missing_geoms}. Update LIMB_GEOMS to match the "
+                "installed Ant-v5 model."
+            )
+
+        for gid in self.limb_geom_ids:
+
+            if (
+                model.geom_type[gid]
+                != mujoco.mjtGeom.mjGEOM_CAPSULE
+            ):
+                raise RuntimeError(
+                    "Limb geometry "
+                    f"{model.geom(gid).name} is not a capsule."
+                )
+
+        # Every body below the torso belongs to a leg chain
+        # (world = 0, torso = 1). This includes the unnamed ankle
+        # bodies, which a name lookup cannot find.
+        self.limb_body_ids = list(
+            range(
+                2,
+                model.nbody,
+            )
+        )
 
         if len(self.limb_body_ids) == 0:
             raise RuntimeError(
                 "No Ant limb bodies were found. "
-                "Check the Ant-v5 body names."
+                "Check the Ant-v5 model."
             )
 
     # ==================================================================
@@ -406,6 +533,18 @@ class MorphologyAntEnv(gym.Wrapper):
             self.nominal_body_mass
         )
 
+        model.body_inertia[:] = (
+            self.nominal_body_inertia
+        )
+
+        model.body_pos[:] = (
+            self.nominal_body_pos
+        )
+
+        model.body_ipos[:] = (
+            self.nominal_body_ipos
+        )
+
         model.actuator_gear[:] = (
             self.nominal_actuator_gear
         )
@@ -418,8 +557,16 @@ class MorphologyAntEnv(gym.Wrapper):
             self.nominal_geom_size
         )
 
-        model.body_pos[:] = (
-            self.nominal_body_pos
+        model.geom_pos[:] = (
+            self.nominal_geom_pos
+        )
+
+        model.geom_rbound[:] = (
+            self.nominal_geom_rbound
+        )
+
+        model.geom_aabb[:] = (
+            self.nominal_geom_aabb
         )
 
     def _scale_limb_geometry(
@@ -427,14 +574,26 @@ class MorphologyAntEnv(gym.Wrapper):
         limb_scale,
     ):
         """
-        Scale Ant limb geometry and limb-chain body positions.
+        Scale Ant limb length.
 
         Ant-v5 uses capsule geometries for the legs. For these
-        geometries, geom_size[0] is the radius and geom_size[1]
-        controls the capsule length.
+        geometries, geom_size[0] is the radius and geom_size[1] is the
+        capsule HALF-length.
 
         The radius is kept unchanged while the longitudinal
         dimension is scaled.
+
+        What is scaled (all relative to the nominal model):
+
+          * body_pos and body_ipos of every body below the torso
+            (attachment points of hips and ankles, and the local centre
+            of mass of each limb body),
+          * geom_pos of each limb capsule (a capsule defined with
+            "fromto" is centred on the midpoint of the segment),
+          * geom_size[1] (half-length) of each limb capsule,
+          * geom_rbound and geom_aabb of each limb capsule, which
+            MuJoCo uses for collision broad-phase and which would
+            otherwise stay at their nominal values.
         """
 
         model = self.unwrapped.model
@@ -446,57 +605,68 @@ class MorphologyAntEnv(gym.Wrapper):
             return
 
         # ----------------------------------------------------------
-        # Scale limb body attachment positions.
+        # Scale limb-chain body positions and local COM offsets.
         # ----------------------------------------------------------
 
         for bid in self.limb_body_ids:
 
-            nominal_pos = (
+            model.body_pos[bid] = (
                 self.nominal_body_pos[bid]
+                * limb_scale
             )
 
-            model.body_pos[bid] = (
-                nominal_pos * limb_scale
+            model.body_ipos[bid] = (
+                self.nominal_body_ipos[bid]
+                * limb_scale
             )
 
         # ----------------------------------------------------------
         # Scale limb geometry.
         #
-        # Ant-v5 leg geometries are capsules. Keep the radius
-        # unchanged and scale the capsule half-length.
+        # Keep the capsule radius unchanged and scale the capsule
+        # half-length and centre.
         # ----------------------------------------------------------
 
         for gid in self.limb_geom_ids:
 
-            nominal_size = (
-                self.nominal_geom_size[gid]
+            radius = float(
+                self.nominal_geom_size[gid, 0]
             )
 
-            # Keep capsule radius unchanged.
+            half_length = (
+                float(
+                    self.nominal_geom_size[gid, 1]
+                )
+                * limb_scale
+            )
+
+            model.geom_pos[gid] = (
+                self.nominal_geom_pos[gid]
+                * limb_scale
+            )
+
             model.geom_size[
                 gid,
-                0,
-            ] = nominal_size[0]
+                1,
+            ] = half_length
 
-            # Scale capsule length.
-            if model.geom_size.shape[1] > 1:
+            model.geom_rbound[gid] = (
+                half_length + radius
+            )
 
-                model.geom_size[
-                    gid,
-                    1,
-                ] = (
-                    nominal_size[1]
-                    * limb_scale
-                )
+            model.geom_aabb[
+                gid,
+                0:3,
+            ] = 0.0
 
-        # ----------------------------------------------------------
-        # Recompute MuJoCo dynamics after morphology changes.
-        # ----------------------------------------------------------
-
-        mujoco.mj_forward(
-            model,
-            self.unwrapped.data,
-        )
+            model.geom_aabb[
+                gid,
+                3:6,
+            ] = (
+                radius,
+                radius,
+                half_length + radius,
+            )
 
     def _set_morphology(
         self,
@@ -513,12 +683,6 @@ class MorphologyAntEnv(gym.Wrapper):
         """
 
         model = self.unwrapped.model
-
-        # --------------------------------------------------------------
-        # Always restore nominal values first.
-        # --------------------------------------------------------------
-
-        self._restore_nominal_morphology()
 
         # --------------------------------------------------------------
         # Validate parameters.
@@ -544,11 +708,22 @@ class MorphologyAntEnv(gym.Wrapper):
                 )
 
         # --------------------------------------------------------------
-        # 1. Global body mass.
+        # Always restore nominal values first.
+        # --------------------------------------------------------------
+
+        self._restore_nominal_morphology()
+
+        # --------------------------------------------------------------
+        # 1. Global body mass (inertia scales with mass).
         # --------------------------------------------------------------
 
         model.body_mass[:] = (
             self.nominal_body_mass
+            * mass_scale
+        )
+
+        model.body_inertia[:] = (
+            self.nominal_body_inertia
             * mass_scale
         )
 
@@ -593,9 +768,15 @@ class MorphologyAntEnv(gym.Wrapper):
         )
 
         # --------------------------------------------------------------
-        # Recompute MuJoCo forward dynamics after changing model
+        # Recompute derived MuJoCo constants (subtree masses, inverse
+        # weights, ...) and forward dynamics after changing model
         # parameters.
         # --------------------------------------------------------------
+
+        mujoco.mj_setConst(
+            model,
+            self.unwrapped.data,
+        )
 
         mujoco.mj_forward(
             model,
@@ -847,6 +1028,10 @@ class MorphologyAntEnv(gym.Wrapper):
 
         1.0 = exact target
         approaches 0.0 as error increases.
+
+        NOTE: this raw form gives a large positive reward for NOT
+        moving (value = 0 means error = -target). The Forward / Left /
+        Right rewards therefore use _normalized_tracking below.
         """
 
         return float(
@@ -855,12 +1040,48 @@ class MorphologyAntEnv(gym.Wrapper):
             )
         )
 
+    @staticmethod
+    def _normalized_tracking(
+        value,
+        target,
+        scale,
+    ):
+        """
+        Baseline-subtracted tracking reward.
+
+            1.0   when value == target
+            0.0   when value == 0   (the robot is not moving)
+            < 0   when worse than not moving at all
+
+        This is what stops a robot that simply stands still from
+        collecting a large constant reward on the tracking intentions.
+        """
+
+        floor = float(
+            np.exp(
+                -scale * abs(target)
+            )
+        )
+
+        raw = float(
+            np.exp(
+                -scale * abs(value - target)
+            )
+        )
+
+        return (
+            (raw - floor)
+            / (1.0 - floor)
+        )
+
     def _intention_reward(
         self,
         forward_velocity,
         lateral_velocity,
         yaw_velocity,
         uprightness,
+        lateral_penalty_speed=None,
+        yaw_penalty_rate=None,
     ):
         """
         Compute the intention-specific reward.
@@ -874,7 +1095,20 @@ class MorphologyAntEnv(gym.Wrapper):
 
         while also penalizing unwanted motion and encouraging
         upright behavior.
+
+        Returns the total (task + uprightness). The task part alone is
+        stored in self._last_task_reward and logged by step() as
+        info["task_reward"].
         """
+
+        # The Forward penalties can use smoothed values (penalty_tau).
+        if lateral_penalty_speed is None:
+            lateral_penalty_speed = lateral_velocity
+
+        if yaw_penalty_rate is None:
+            yaw_penalty_rate = yaw_velocity
+
+        self._last_forward_terms = (0.0, 0.0, 0.0)
 
         if self.intention == 0:
 
@@ -883,20 +1117,20 @@ class MorphologyAntEnv(gym.Wrapper):
             # ----------------------------------------------------------
 
             forward_tracking = (
-                self._tracking_reward(
-                    forward_velocity
-                    - self.FORWARD_TARGET,
+                self._normalized_tracking(
+                    forward_velocity,
+                    self.FORWARD_TARGET,
                     self.FORWARD_TRACK_WEIGHT,
                 )
             )
 
             lateral_penalty = (
-                abs(lateral_velocity)
+                abs(lateral_penalty_speed)
                 * self.FORWARD_LATERAL_WEIGHT
             )
 
             yaw_penalty = (
-                abs(yaw_velocity)
+                abs(yaw_penalty_rate)
                 * self.FORWARD_YAW_WEIGHT
             )
 
@@ -906,6 +1140,12 @@ class MorphologyAntEnv(gym.Wrapper):
                 - yaw_penalty
             )
 
+            self._last_forward_terms = (
+                float(forward_tracking),
+                float(-lateral_penalty),
+                float(-yaw_penalty),
+            )
+
         elif self.intention == 1:
 
             # ----------------------------------------------------------
@@ -913,9 +1153,9 @@ class MorphologyAntEnv(gym.Wrapper):
             # ----------------------------------------------------------
 
             yaw_tracking = (
-                self._tracking_reward(
-                    yaw_velocity
-                    - self.LEFT_YAW_TARGET,
+                self._normalized_tracking(
+                    yaw_velocity,
+                    self.LEFT_YAW_TARGET,
                     self.TURN_YAW_WEIGHT,
                 )
             )
@@ -943,9 +1183,9 @@ class MorphologyAntEnv(gym.Wrapper):
             # ----------------------------------------------------------
 
             yaw_tracking = (
-                self._tracking_reward(
-                    yaw_velocity
-                    - self.RIGHT_YAW_TARGET,
+                self._normalized_tracking(
+                    yaw_velocity,
+                    self.RIGHT_YAW_TARGET,
                     self.TURN_YAW_WEIGHT,
                 )
             )
@@ -993,7 +1233,9 @@ class MorphologyAntEnv(gym.Wrapper):
         # Uprightness reward.
         #
         # This prevents the controller from obtaining an intention
-        # reward by sacrificing physical stability.
+        # reward by sacrificing physical stability. It is a constant
+        # for any policy that stays upright, so it does not
+        # discriminate between controllers.
         # --------------------------------------------------------------
 
         upright_reward = (
@@ -1003,6 +1245,10 @@ class MorphologyAntEnv(gym.Wrapper):
                 1.0,
             )
             * self.UPRIGHT_WEIGHT
+        )
+
+        self._last_task_reward = float(
+            reward
         )
 
         return float(
@@ -1088,6 +1334,56 @@ class MorphologyAntEnv(gym.Wrapper):
                     recovery_time,
                 )
             )
+
+    # ==================================================================
+    # START POSE
+    # ==================================================================
+
+    def _project_joints_into_range(self):
+        """
+        Clip every limited hinge joint into its allowed range and zero
+        its velocity, then recompute the kinematics and the stored base
+        observation. See the class docstring (change 5).
+        """
+
+        model = self.unwrapped.model
+        data = self.unwrapped.data
+
+        for joint_id in range(model.njnt):
+
+            if (
+                model.jnt_limited[joint_id]
+                and model.jnt_type[joint_id]
+                == mujoco.mjtJoint.mjJNT_HINGE
+            ):
+
+                qpos_index = int(
+                    model.jnt_qposadr[joint_id]
+                )
+
+                dof_index = int(
+                    model.jnt_dofadr[joint_id]
+                )
+
+                low, high = model.jnt_range[joint_id]
+
+                data.qpos[qpos_index] = np.clip(
+                    data.qpos[qpos_index],
+                    low,
+                    high,
+                )
+
+                data.qvel[dof_index] = 0.0
+
+        mujoco.mj_forward(
+            model,
+            data,
+        )
+
+        self._last_base_obs = np.asarray(
+            self.unwrapped._get_obs(),
+            dtype=np.float32,
+        )
 
     # ==================================================================
     # RESET
@@ -1190,6 +1486,10 @@ class MorphologyAntEnv(gym.Wrapper):
             )
         )
 
+        # Start with every limited joint inside its allowed range.
+        if self.start_in_joint_range:
+            self._project_joints_into_range()
+
         # --------------------------------------------------------------
         # Reset metrics.
         # --------------------------------------------------------------
@@ -1202,6 +1502,12 @@ class MorphologyAntEnv(gym.Wrapper):
         self.fall_step = None
         self.fall_start_time = None
         self.recovery_time = None
+
+        self._last_task_reward = 0.0
+
+        self._yaw_ema = 0.0
+        self._lat_ema = 0.0
+        self._last_forward_terms = (0.0, 0.0, 0.0)
 
         # --------------------------------------------------------------
         # Initial position.
@@ -1494,13 +1800,43 @@ class MorphologyAntEnv(gym.Wrapper):
         # Intention reward.
         # --------------------------------------------------------------
 
+        # Smoothed values for the Forward penalties (penalty_tau).
+        if self.penalty_tau is not None and dt > 0.0:
+
+            alpha = min(
+                1.0,
+                dt / self.penalty_tau,
+            )
+
+            self._yaw_ema += alpha * (
+                yaw_velocity - self._yaw_ema
+            )
+
+            self._lat_ema += alpha * (
+                lateral_velocity - self._lat_ema
+            )
+
+            yaw_for_penalty = self._yaw_ema
+            lateral_for_penalty = self._lat_ema
+
+        else:
+
+            yaw_for_penalty = yaw_velocity
+            lateral_for_penalty = lateral_velocity
+
         intention_reward = (
             self._intention_reward(
                 forward_velocity=forward_velocity,
                 lateral_velocity=lateral_velocity,
                 yaw_velocity=yaw_velocity,
                 uprightness=uprightness,
+                lateral_penalty_speed=lateral_for_penalty,
+                yaw_penalty_rate=yaw_for_penalty,
             )
+        )
+
+        task_reward = float(
+            self._last_task_reward
         )
 
         # --------------------------------------------------------------
@@ -1643,6 +1979,18 @@ class MorphologyAntEnv(gym.Wrapper):
                 # Reward decomposition.
                 "intention_reward": float(
                     intention_reward
+                ),
+                "task_reward": float(
+                    task_reward
+                ),
+                "forward_tracking_term": float(
+                    self._last_forward_terms[0]
+                ),
+                "forward_lateral_term": float(
+                    self._last_forward_terms[1]
+                ),
+                "forward_yaw_term": float(
+                    self._last_forward_terms[2]
                 ),
                 "control_cost": float(
                     control_cost

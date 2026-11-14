@@ -11,3 +11,11 @@ venv/
 all_python_codes.txt
 *.mp4
 *.gif
+models/*.zip
+models/checkpoints/
+logs/
+models_backup_*/
+results_with_standstill/
+results_backup_*/
+results/archive_old/
+figures/archive_old/

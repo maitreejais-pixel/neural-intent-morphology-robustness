@@ -2,6 +2,21 @@ import numpy as np
 
 
 # ======================================================================
+# CONTROL TIMESTEP
+# ======================================================================
+
+# One env.step() advances the simulation by frame_skip (5) x the MuJoCo
+# physics timestep (0.01 s) = 0.05 s.
+#
+# FIXED: the Direct and CPG controllers used to default to dt = 0.01,
+# i.e. the physics timestep instead of the control step. Their phase
+# therefore advanced 5x too slowly and every gait ran at 0.2x its
+# nominal frequency in real time (frequency = 1.5 -> 0.3 Hz instead of
+# 1.5 Hz). They now use the true control step.
+CONTROL_DT = 0.05
+
+
+# ======================================================================
 # COMMON ANT CONTROLLER
 # ======================================================================
 
@@ -199,17 +214,29 @@ class DirectTrajectoryController(AntController):
         - learned parameters
 
     Therefore, it represents the least adaptive baseline.
+
+    Timing note: the phase now advances by the true control step
+    (CONTROL_DT = 0.05 s), so frequency=1.5 really is 1.5 Hz. The
+    previous default (dt=0.01) made every gait run at 0.2x frequency.
+
+    Tuned defaults (scripts/tune_baselines.py, nominal morphology, full
+    Forward -> Left -> Right -> Stop schedule, 10 tuning episodes with
+    seeds 200-209, selection by mean task reward; results in
+    results/tuning_direct.csv): amplitude 0.3, frequency 0.3 Hz.
+    HONEST CAVEAT: this setting stays upright (0% falls) but does NOT
+    locomote: its forward-speed error is 1.00 (no forward motion), its
+    task reward 124 is below the stand-still reference (150), and no
+    other setting in the grid walked. A separate random search over a
+    7-parameter open-loop gait family (about 4,000 rollouts) found no
+    gait that walked without falling. Report this baseline as
+    non-locomoting.
     """
 
     def __init__(
         self,
-        amplitude=0.45,
-        frequency=1.5,
-        # NOTE: 0.01 s is the MuJoCo physics timestep, but one control
-        # step lasts 0.05 s (frame_skip = 5). The gait therefore runs at
-        # 0.2 * frequency Hz in real time (frequency=1.5 -> 0.3 Hz).
-        # Left unchanged so the published results reproduce.
-        dt=0.01,
+        amplitude=0.3,
+        frequency=0.3,
+        dt=CONTROL_DT,
     ):
         super().__init__()
 
@@ -308,13 +335,12 @@ class DirectTrajectoryController(AntController):
 
         elif intention == 1:
 
-            # FIXED comment (behavior unchanged): under this project's
-            # frame convention (x=forward, y=left, z=up), POSITIVE yaw
-            # is the left-turn direction. Slowing propulsion on the
-            # left side while the right side keeps pushing at full
-            # strength pivots the body toward positive (left) yaw,
-            # which is exactly the physically correct behavior for a
-            # left turn. No logic change needed here.
+            # Under this project's frame convention
+            # (x=forward, y=left, z=up), POSITIVE yaw is the left-turn
+            # direction. Slowing propulsion on the left side while the
+            # right side keeps pushing at full strength pivots the body
+            # toward positive (left) yaw, which is exactly the
+            # physically correct behavior for a left turn.
 
             for leg_id in self.LEFT_LEGS:
 
@@ -334,11 +360,9 @@ class DirectTrajectoryController(AntController):
 
         elif intention == 2:
 
-            # FIXED comment (behavior unchanged): NEGATIVE yaw is the
-            # right-turn direction under this project's frame
-            # convention. Slowing the right side pivots the body
-            # toward negative (right) yaw. No logic change needed
-            # here.
+            # NEGATIVE yaw is the right-turn direction under this
+            # project's frame convention. Slowing the right side pivots
+            # the body toward negative (right) yaw.
 
             for leg_id in self.LEFT_LEGS:
 
@@ -424,36 +448,35 @@ class FixedCPGController(AntController):
 
     Gain tuning note
     -----------------
-    A multi-seed sweep (see tune_cpg.py / tune_cpg_round2.py /
-    robust_check.py in the project root) initially suggested
-    frequency=1.30, hip_amplitude=0.35, kd=0.50 as an improvement,
-    based on Forward-intention distance alone. Evaluating that
-    candidate across ALL FOUR intentions (eval_all_intentions.py)
-    showed it was overfit to Forward: it did walk ~2.5x further
-    going straight, but Left and Right fell 4-5x sooner (avg
-    fall_step ~40-47 vs ~170-194), and Stop drifted more than twice
-    as far while falling twice as often. The ORIGINAL defaults below
-    are the better-balanced controller once all four intentions are
-    weighed, so they have been kept rather than replaced. This
-    controller is not tuned to be maximally stable in any one
-    direction -- it is meant to remain a reasonably-behaved,
-    non-adaptive baseline that the morphology-aware PPO controller is
-    expected to outperform under perturbation.
+    The earlier multi-seed sweeps (tune_cpg.py / tune_cpg_round2.py /
+    robust_check.py / eval_all_intentions.py) were run with the OLD
+    timing, in which the gait actually ran at 0.2x its nominal
+    frequency, and scored Forward walking only; their conclusions do
+    not apply.
+
+    Tuned defaults (scripts/tune_baselines.py, nominal morphology, full
+    four-intention schedule, 10 tuning episodes with seeds 200-209,
+    selection by mean task reward; results in results/tuning_cpg.csv):
+    frequency 1.0 Hz, hip amplitude 0.25, kd 0.2 (ankle amplitude 0.40
+    and kp 1.8 were not searched). Only 1 of the 32 grid settings had
+    no falls over the 10 seeds; an earlier 3-episode search picked a
+    setting (hip 0.5, kd 0.5) that fell within 17 steps on a fresh
+    seed, which is why 10 episodes are used.
+    HONEST CAVEAT: this setting stays upright (0% falls) but does NOT
+    locomote: its forward-speed error is 1.01 (no forward motion), its
+    task reward 146 is about the stand-still reference (150). Report
+    this baseline as non-locomoting.
     """
 
     def __init__(
         self,
-        frequency=1.5,
-        hip_amplitude=0.65,
+        frequency=1.0,
+        hip_amplitude=0.25,
         ankle_amplitude=0.40,
         kp=1.8,
-        kd=0.20,
+        kd=0.2,
         action_scale=2.0,
-        # NOTE: 0.01 s is the MuJoCo physics timestep, but one control
-        # step lasts 0.05 s (frame_skip = 5). The gait therefore runs at
-        # 0.2 * frequency Hz in real time (frequency=1.5 -> 0.3 Hz).
-        # Left unchanged so the published results reproduce.
-        dt=0.01,
+        dt=CONTROL_DT,
     ):
         super().__init__()
 
@@ -628,11 +651,10 @@ class FixedCPGController(AntController):
                     + self.LEG_PHASE[leg_id]
                 )
 
-                # FIXED comment (behavior unchanged): POSITIVE yaw =
-                # left under this project's frame convention. Keep the
-                # normal gait direction and phase; only reduce the
-                # amplitude of the left side to pivot toward positive
-                # (left) yaw.
+                # POSITIVE yaw = left under this project's frame
+                # convention. Keep the normal gait direction and
+                # phase; only reduce the amplitude of the left side to
+                # pivot toward positive (left) yaw.
 
                 side_scale = (
                     0.55
@@ -673,11 +695,10 @@ class FixedCPGController(AntController):
                     + self.LEG_PHASE[leg_id]
                 )
 
-                # FIXED comment (behavior unchanged): NEGATIVE yaw =
-                # right under this project's frame convention. Keep
-                # the normal gait direction and phase; only reduce the
-                # amplitude of the right side to pivot toward negative
-                # (right) yaw.
+                # NEGATIVE yaw = right under this project's frame
+                # convention. Keep the normal gait direction and
+                # phase; only reduce the amplitude of the right side
+                # to pivot toward negative (right) yaw.
 
                 side_scale = (
                     1.0
@@ -836,14 +857,22 @@ class MorphologyAwarePPOController(AntController):
 
     The policy learns to transform the same intention into appropriate
     motor commands under different physical conditions.
+
+    (For the no-morphology ablation the observation has 109
+    dimensions: pass expected_observation_dim=109.)
     """
 
     EXPECTED_OBSERVATION_DIM = 113
 
-    def __init__(self, model):
+    def __init__(self, model, expected_observation_dim=None):
         super().__init__()
 
         self.model = model
+
+        if expected_observation_dim is not None:
+            self.EXPECTED_OBSERVATION_DIM = int(
+                expected_observation_dim
+            )
 
     def reset(self):
         super().reset()
@@ -868,7 +897,8 @@ class MorphologyAwarePPOController(AntController):
 
             raise ValueError(
                 "MorphologyAwarePPOController requires "
-                "the complete 113-dimensional observation."
+                "the complete observation "
+                f"({self.EXPECTED_OBSERVATION_DIM} dimensions)."
             )
 
         obs = np.asarray(
