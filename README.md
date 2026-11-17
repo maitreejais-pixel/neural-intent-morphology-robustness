@@ -4,41 +4,47 @@ Code and data for the paper
 
 > **Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion**
 
-The project asks whether separating *what a user intends* (a discrete intention such as Forward, Left, Right, Stop) from *how a particular body executes it* makes a legged robot more robust when its physical parameters change. It compares three controllers, plus a zero-torque reference, on the MuJoCo **Ant-v5** quadruped under systematic perturbations of mass, limb length, joint strength, and friction.
+The project asks, in simulation, whether a locomotion policy that observes the robot's own physical parameters stays more effective under physical variation than an otherwise identical policy that does not. A prescribed intention schedule (Forward, Left, Right, Stop) drives a quadruped in MuJoCo **Ant-v5** while mass, limb length, joint strength and friction are perturbed by 0–50%. A four-class EEG intention decoder is validated separately on **synthetic** data and is **not connected** to the controllers.
 
-## Main findings
+## Main findings (5 training seeds per PPO arm)
 
-Mean over 10 episodes per condition, 0–50% perturbation on each of four axes (21 distinct conditions).
+Mean over the 21 distinct conditions (nominal plus four axes at five levels), 10 episodes per condition.
 
-| Controller | Nominal reward | Falls |
+| Controller | Task reward | Fall rate |
 |---|---|---|
-| (A) Direct, open-loop actuator commands | 650.2 | 1 of 10 episodes at 40% limb length, none elsewhere |
-| (B) Fixed-gain CPG + local PD feedback | −13.9 | ≥ 90% of episodes in all but two conditions (60% at 50% joint strength, 50% at 50% limb length), including nominal |
-| (C) Morphology-aware PPO | 648.9 | none |
-| (R) Zero-torque stand-still reference | 672.1 | none |
+| Stand-still reference | 149.8 | 0% |
+| Direct (open loop) | 123.4 | 0% |
+| CPG-style + PD feedback | 106.1 | 27.6% |
+| Morphology-aware PPO | 302.6 ± 52.6 | 14.2% |
+| Morphology-blind PPO | 311.5 ± 39.6 | 9.9% |
 
-- PPO has slightly higher mean reward than the open-loop controller under friction and joint-strength perturbation, is comparable under mass perturbation, and is substantially worse under limb-length perturbation (58.3% vs. 94.9% retained reward at 50%).
-- **A controller that does nothing scores higher than both Direct and PPO in all 21 conditions**, so on this reward neither shows sustained locomotion. Read the reward and fall-rate results with that in mind.
+PPO rows: mean ± SD over five training seeds. Task reward excludes the fall penalty, so fall rate is always reported beside it.
+
+- **Morphology conditioning gave no measurable benefit.** Aware minus blind: −8.9 task-reward points (95% CI −110 to +92, Welch p = 0.77) and +4.3 points of fall rate (CI −0.4 to +9.0, p = 0.22). With five seeds, differences below about 100 reward points cannot be excluded.
+- A zero-torque reference exposed a flaw in the initial reward, which paid for standing still. After correction both PPO policies walk, while the tuned hand-built baselines do not.
+- The EEG decoder reaches 68.75% five-fold cross-validated accuracy (macro-F1 68.79%) on synthetic data only.
+
+The full numbers are in `results/aggregate_report_v2.txt`.
 
 ## What is implemented
 
-- **Synthetic EEG decoder.** 4-class synthetic motor-imagery EEG (22 channels, 250 Hz, 4 s trials, 576 trials), Welch log band-power features (8–30 Hz), standardization, and linear discriminant analysis, evaluated with 5-fold stratified cross-validation (68.75% accuracy, 68.79% macro-F1). This is a synthetic-data result, not real-EEG performance.
-- **Environment.** `MorphologyAntEnv`, a Gymnasium wrapper around Ant-v5 that adds an intention one-hot, four morphology parameters, an intention-specific reward, fall detection with episode termination, and morphology perturbation.
-- **Controllers.** Direct open-loop actuator commands, a fixed-gain CPG with local PD feedback, a morphology-conditioned PPO policy (Stable-Baselines3), and a zero-torque stand-still reference.
-- **Protocol.** Four perturbation axes × six levels × 10 episodes per controller, logging reward, falls, energy, and displacement.
-- **Analysis.** Summary tables, reward-minus-stand-still comparison, and publication figures generated directly from the results CSV.
+- **Synthetic EEG decoder.** 576 synthetic motor-imagery-style trials (22 channels, 250 Hz, 4 s), log Welch band-power features (8–30 Hz), standardization and linear discriminant analysis, evaluated with 5-fold stratified cross-validation. This is a synthetic-data result, not real-EEG performance.
+- **Environment.** `MorphologyAntEnv`, a Gymnasium wrapper around Ant-v5 that adds an intention one-hot, four morphology parameters, a baseline-subtracted intention-specific reward, fall detection with episode termination, and morphology perturbation.
+- **Controllers.** A zero-torque stand-still reference, a Direct open-loop controller, a CPG-style controller (sinusoidal references with joint-level PD feedback), and two PPO policies (Stable-Baselines3) trained with identical procedures: one observes the morphology vector, one does not.
+- **Protocol.** Four perturbation axes × six levels × 10 episodes per controller and training seed, five training seeds per PPO arm.
+- **Analysis.** Per-seed aggregation, aware-minus-blind comparisons with confidence intervals, leave-one-seed-out checks, and figure scripts.
 
 ## Important design notes
 
-- **The decoder is not connected to the controllers.** The controller experiments use a fixed, prescribed intention schedule (Forward → Left → Right → Stop, 150 steps each, repeating over the 1000-step episode). Decoder errors never reach them. Integrating the decoded stream is future work.
-- **Simulation details.** Physics timestep 0.01 s, `frame_skip = 5`, so one control step lasts 0.05 s; episodes are 1000 steps (50 s). A fall (torso height < 0.25 m or uprightness < 0.45) ends the episode.
-- **Observation.** 105 (Ant) + 4 (morphology) + 4 (intention one-hot) = 113 dimensions for the PPO policy.
-- **Morphology vector order.** `[mass, limb_length, joint_strength, friction]`, nominal `1.0`. Perturbation *raises* mass and limb length and *lowers* joint strength and friction.
+- **The decoder is not connected to the controllers.** The controller experiments use a fixed schedule (Forward → Left → Right → Stop, 150 steps each, repeating over the 1000-step episode). Decoder errors never reach them.
+- **Simulation.** Physics timestep 0.01 s with `frame_skip = 5`, so one control step lasts 0.05 s; episodes last up to 1000 steps (50 s). A fall (torso height < 0.25 m or uprightness < 0.45) ends the episode.
+- **Observation.** 105 (Ant) + 4 (morphology) + 4 (intention one-hot) = 113 dimensions; 109 for the morphology-blind policy.
+- **Morphology vector.** `[mass, limb_length, joint_strength, friction]`, nominal `1.0`. Perturbation raises mass and limb length and lowers joint strength and friction.
 - **Intentions.** `0` Forward, `1` Left, `2` Right, `3` Stop.
 
 ## Installation
 
-Python 3.10 or newer.
+Python 3.10 or newer (developed with 3.12).
 
 ```bash
 python -m venv .venv
@@ -47,7 +53,9 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The scripts import the `src` package, so run everything **from the repository root** with the root on the Python path:
+`requirements.txt` lists the main packages (Gymnasium 1.4.0, MuJoCo 3.17.0, Stable-Baselines3 2.9.2, PyTorch 2.15.0, NumPy 2.5.4, SciPy, scikit-learn, pandas, matplotlib). `requirements_frozen.txt` lists every installed package. NumPy 2.x is required.
+
+Run everything **from the repository root**. If you see `ModuleNotFoundError: No module named 'src'`, run the script as a module (for example `python -m scripts.run_eeg`) or set the root on the Python path:
 
 ```bash
 # Windows (PowerShell)
@@ -56,11 +64,9 @@ $env:PYTHONPATH = "."
 export PYTHONPATH=.
 ```
 
-If you see `ModuleNotFoundError: No module named 'src'`, this is the cause.
-
 ## Quick start
 
-A fast check that the environment and controllers work (no trained model needed):
+A fast check that the environment and the hand-built controllers work (no trained model needed):
 
 ```bash
 python scripts/run_experiments.py --controllers direct cpg standstill --episodes 2 --levels 0 0.5 --output results/smoke.csv
@@ -68,106 +74,110 @@ python scripts/run_experiments.py --controllers direct cpg standstill --episodes
 
 ## Reproducing the paper
 
-All commands run from the repository root. Reported numbers come from `results/summary.csv`; figures are generated from it, not typed in.
+Training takes about 3.5 hours per seed for both arms on a laptop CPU.
 
-**1. EEG decoder:**
-
-```bash
-python scripts/run_eeg.py
-```
-
-Prints accuracy, macro-F1, and the confusion matrix (68.75% / 68.79%, Left recall 80.6%).
-
-**2. Train the PPO policy** (5M steps, about 80 minutes on a laptop CPU):
+**1. Tune the hand-built baselines** (nominal morphology, full schedule, seeds 200–209):
 
 ```bash
-python scripts/train_policy.py
+python scripts/tune_baselines.py
 ```
 
-Saves a checkpoint every 100k steps in `models/checkpoints/` and the final model as `models/morphology_ant_ppo.zip`. **Back up `models/` first**: training overwrites both. The training run uses seed 42, 8 vectorized environments, `MlpPolicy` (two hidden layers of 64 units), and samples morphology per episode (mass and limb length from U(0.5, 1.5), joint strength and friction from U(0.5, 1.0)) with one intention per episode.
+Writes `results/tuning_direct.csv` and `results/tuning_cpg.csv`.
 
-**3. Choose a checkpoint** (optional):
+**2. Train both arms for each seed.** Stage 0: Forward-only, 1M steps. Stage 1: four intentions, 3M steps, learning rate 3e-4. Stage 2: continued, 4M steps, learning rate 1e-4. Then checkpoint selection (16 nominal and 16 random-morphology episodes, fall-rate limit 0.10) writes `models/final_<arm>_s<seed>.zip`:
 
 ```bash
-python eval_checkpoints.py
+python scripts/run_pipeline.py --seeds 42
+python scripts/run_pipeline.py --seeds 43     # likewise 44, 45, 46 (one terminal per seed)
 ```
 
-Scores 10 evenly spaced checkpoints with a heuristic error score at nominal morphology. The score is only a coarse indicator and cannot distinguish standing from locomotion. The policy reported in the paper is the **2.2M-step checkpoint**; to use it:
+**3. Per-intention evaluation** (each intention held fixed, 20 episodes of 300 steps):
 
 ```bash
-# Windows (PowerShell)
-Copy-Item models\checkpoints\morphology_ant_ppo_2200000_steps.zip models\morphology_ant_ppo.zip -Force
-# macOS / Linux
-cp models/checkpoints/morphology_ant_ppo_2200000_steps.zip models/morphology_ant_ppo.zip
+python scripts/evaluate_intentions.py --model models/final_aware_s42.zip --episodes 20 > results/intent_aware_s42.txt
+python scripts/evaluate_intentions.py --model models/final_nomorph_s42.zip --episodes 20 --no-morph > results/intent_nomorph_s42.txt
 ```
 
-**4. Run the experiments:**
+**4. Perturbation experiments** (21 conditions, 10 episodes each, evaluation seeds 1000–1009). Seed 42 also runs the three deterministic references; the other seeds need only the two PPO arms:
 
 ```bash
-python scripts/run_experiments.py --output results/physics_results.csv
-python scripts/run_experiments.py --controllers standstill --output results/standstill_results.csv
+python scripts/run_experiments.py --controllers direct cpg ppo ppo_nomorph standstill --model models/final_aware_s42.zip --model-nomorph models/final_nomorph_s42.zip --output results/physics_results_s42.csv
+python scripts/run_experiments.py --controllers ppo ppo_nomorph --model models/final_aware_s43.zip --model-nomorph models/final_nomorph_s43.zip --output results/physics_results_s43.csv
 ```
 
-The first command runs Direct, CPG, and PPO (default 10 episodes, levels 0 to 0.5 in steps of 0.1, 720 episode records). The second runs the stand-still reference (240 records). Merge them:
+**5. Aggregate over seeds.** Each distinct condition is counted once (the nominal point is shared by all axes); the report includes Welch tests, 95% confidence intervals and leave-one-seed-out checks:
 
 ```bash
-python -c "import pandas as pd; a=pd.read_csv('results/physics_results.csv'); b=pd.read_csv('results/standstill_results.csv'); pd.concat([a,b]).to_csv('results/physics_results_with_standstill.csv', index=False)"
+python scripts/aggregate_seeds.py > results/aggregate_report_v2.txt
 ```
 
-**5. Analyze and plot:**
+**6. Figures:**
 
 ```bash
-python scripts/analyze_results.py --input results/physics_results_with_standstill.csv --outdir results_with_standstill
-python scripts/make_figures.py
+python scripts/make_paper_figures.py
+python scripts/make_fig1.py
 ```
 
-`analyze_results.py` writes `summary.csv`, the reward-minus-stand-still table, per-axis plots, and the best-controller table. `make_figures.py` writes Figures 3–5 (reward, limb-length fall rate, mass-axis energy) to `figures/`.
+**7. Optional: nominal re-check on fresh start states** (seeds 2000–2019):
 
-### Reproducibility notes
+```bash
+python scripts/nominal_check.py
+```
 
-- Direct, CPG, and the PPO policy are deterministic. Episodes within a condition differ only through the simulator's small reset noise.
-- Each controller uses a fixed block of initial-state seeds (Direct 1000–1009, CPG 2000–2009, PPO 3000–3009; the stand-still reference uses 1000–1009), reused for every axis and level. The 0% level is therefore identical across axes, giving 630 unique episodes for the three controllers (210 per controller).
-- Retraining may not reproduce the reported checkpoint exactly (library versions and hardware can change results), so keep the trained model file with your results.
+**8. Synthetic EEG decoder:**
+
+```bash
+python -m scripts.run_eeg
+```
 
 ## Repository layout
 
 ```
-src/
-  env.py                  MorphologyAntEnv: reward, falls, morphology perturbation
-  controllers.py          Direct, fixed-gain CPG + PD, PPO wrapper, stand-still reference
-  eeg.py                  Synthetic EEG generation, log band-power features, LDA decoder
-scripts/
-  run_eeg.py              Evaluate the synthetic-EEG decoder
-  train_policy.py         Train the morphology-conditioned PPO policy
-  run_experiments.py      Run the perturbation protocol (--controllers, --episodes, --levels, --output)
-  analyze_results.py      Summaries and plots (--input, --outdir)
-  make_figures.py         Paper figures 3-5 from summary.csv
-  evaluate_intentions.py  Behavior of one policy under each intention
-eval_checkpoints.py       Score saved PPO checkpoints
-eval_all_intentions.py    Compare CPG gain sets across all four intentions
-models/                   Trained policy and checkpoints
-results/                  Per-episode results and summaries
+src/        env.py (MorphologyAntEnv), controllers.py, protocol.py (shared schedule and metrics),
+            eeg.py (synthetic EEG decoder)
+scripts/    run_pipeline.py, train_policy.py, run_experiments.py, evaluate_intentions.py,
+            aggregate_seeds.py, tune_baselines.py, nominal_check.py, run_eeg.py,
+            make_paper_figures.py, make_fig1.py, analyze_results.py, eval_forward.py
+results/    per-seed CSVs, per-intention reports, checkpoint-selection and tuning records, aggregate report
+models/     *_config.json for every training run (model weights are not committed)
+figures/    paper figures
+archive/    superseded scripts, kept for history only
+eval_checkpoints.py      checkpoint selection (called by run_pipeline.py)
+diagnose_leg_sides.py    checks the leg and actuator layout of Ant-v5
 ```
 
-Development diagnostics (`diagnose_leg_sides.py`, `scripts/test_actuators.py`, `scripts/test_leg_mapping.py`, `scripts/test_yaw.py`, `test_cpg.py`, `test_intentions.py`, `tune_cpg*.py`, `robust_check.py`) are kept for transparency about how the leg mapping, yaw convention, and CPG gains were checked.
+## Results files
+
+| File | Content |
+|---|---|
+| `results/physics_results_s<seed>.csv` | episode-level results for each training seed |
+| `results/seed_summary.csv`, `seed_overall.csv` | means, SDs and ranges across seeds |
+| `results/morph_vs_nomorph_split.csv`, `leave_one_out.csv` | aware-minus-blind comparisons |
+| `results/aggregate_report_v2.txt` | the report cited in the paper |
+| `results/intent_*.txt` | per-intention behavior of each model |
+| `results/nominal_check.csv` | nominal re-check on fresh start states |
+| `results/checkpoint_selection_ft2_*.csv` | scores of the sampled checkpoints per model |
+| `results/tuning_direct.csv`, `tuning_cpg.csv` | baseline tuning grids |
 
 ## Known limitations
 
-- **Reward calibration.** A zero-torque policy scores above Direct and PPO, so reward near 650 and zero falls reflect standing stability, not locomotion.
-- **Controller time step.** Direct and CPG advance their oscillator phase by 0.01 s per control step, whereas a control step lasts 0.05 s, so their gaits run at 0.3 Hz in real time. Correcting this changes their behavior and requires retuning.
-- **Limb-length perturbation is partial.** It scales the hip-attachment offsets and the half-length of each leg capsule, but not capsule centers or the hip-to-ankle offsets. Mass scaling leaves body inertia unchanged.
-- **Training/evaluation mismatch.** PPO was trained with one intention per episode but evaluated with intention switching every 150 steps.
-- **One training run, one seed.** The PPO result may not generalize across seeds. The checkpoint was chosen from 10 candidates of one run.
-- **Synthetic EEG only.** No real BCI recordings are used, and there is no hardware validation.
+- Trained model weights are not committed. Every run's settings are in `models/*_config.json`; in configs written before a later fix, the `learning_rate` field is a fixed 0.0003 for every stage, and the real value is in `learning_rate_setting`.
+- The two PPO arms do not share an initialization, so "matched by seed" means matched by seed index only; the unpaired Welch test is the main test, and p-values are descriptive and uncorrected.
+- Perturbation levels lie inside the training range, so the study tests robustness within a randomized distribution, not extrapolation to unseen bodies.
+- One model (morphology-aware, seed 44) was selected with the fallback rule because no sampled checkpoint met the fall-rate limit.
+- The Forward penalty weights (yaw 0.30, lateral 0.20) were chosen after Forward-only PPO tests, so they are a degree of freedom of the study.
+- Simulation only: one quadruped, one perturbed parameter at a time, parameters fixed within an episode, no hardware, and synthetic EEG only.
+- The earlier single-seed version of this project is preserved as the git tag `old-single-seed`; its results are superseded.
 
 ## Citation
 
-If you use this code, please cite the paper. The author list and publication details will be added when available.
+If you use this code, please cite the paper. Publication details will be added when available.
 
 ```bibtex
-
-  title        = Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion,
-  author       = Maitree Jaiswal,
-  url          = https://github.com/maitreejais-pixel/neural-intent-morphology-robustness
-
+@misc{jaiswal2026morphology,
+  title  = {Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion},
+  author = {Jaiswal, Maitree},
+  year   = {2026},
+  url    = {https://github.com/maitreejais-pixel/neural-intent-morphology-robustness}
+}
 ```
