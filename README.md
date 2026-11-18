@@ -1,10 +1,10 @@
-# Neural Intent → Morphology-Aware Locomotion
+# Morphology-Conditioned Locomotion Under Physical Variation
 
 Code and data for the paper
 
-> **Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion**
+> **Morphology-Conditioned Locomotion Policies Under Physical Variation: A Controlled Simulation Study**
 
-The project asks, in simulation, whether a locomotion policy that observes the robot's own physical parameters stays more effective under physical variation than an otherwise identical policy that does not. A prescribed intention schedule (Forward, Left, Right, Stop) drives a quadruped in MuJoCo **Ant-v5** while mass, limb length, joint strength and friction are perturbed by 0–50%. A four-class EEG intention decoder is validated separately on **synthetic** data and is **not connected** to the controllers.
+The project asks, in simulation, whether a locomotion policy that observes the robot's own physical parameters performs more robustly under physical variation than a policy trained using the same procedure but without access to those parameters. A prescribed intention schedule (Forward, Left, Right, Stop) drives a quadruped in MuJoCo **Ant-v5** while mass, limb length, joint strength and friction are perturbed by 0–50%. A four-class EEG intention decoder is evaluated separately on **synthetic** data and is **not connected** to the controllers.
 
 ## Main findings (5 training seeds per PPO arm)
 
@@ -20,8 +20,8 @@ Mean over the 21 distinct conditions (nominal plus four axes at five levels), 10
 
 PPO rows: mean ± SD over five training seeds. Task reward excludes the fall penalty, so fall rate is always reported beside it.
 
-- **Morphology conditioning gave no measurable benefit.** Aware minus blind: −8.9 task-reward points (95% CI −110 to +92, Welch p = 0.77) and +4.3 points of fall rate (CI −0.4 to +9.0, p = 0.22). With five seeds, differences below about 100 reward points cannot be excluded.
-- A zero-torque reference exposed a flaw in the initial reward, which paid for standing still. After correction both PPO policies walk, while the tuned hand-built baselines do not.
+- **Morphology conditioning showed no statistically significant advantage.** Aware minus blind: −8.9 task-reward points (95% Welch CI [−77.8, +59.9], p = 0.770) and +4.3 percentage points in fall rate (95% Welch CI [−3.2, +11.7] pp, p = 0.219). With only five training seeds per arm, the confidence intervals remain wide; these results do not establish equivalence between the policies.
+- A zero-torque reference exposed a flaw in the initial reward, which allowed standing still to score too highly. After correcting the reward, both PPO policies learned locomotion, whereas the tested hand-built baselines did not achieve sustained locomotion.
 - The EEG decoder reaches 68.75% five-fold cross-validated accuracy (macro-F1 68.79%) on synthetic data only.
 
 The full numbers are in `results/aggregate_report_v2.txt`.
@@ -32,8 +32,10 @@ The full numbers are in `results/aggregate_report_v2.txt`.
 - **Environment.** `MorphologyAntEnv`, a Gymnasium wrapper around Ant-v5 that adds an intention one-hot, four morphology parameters, a baseline-subtracted intention-specific reward, fall detection with episode termination, and morphology perturbation.
 - **Controllers.** A zero-torque stand-still reference, a Direct open-loop controller, a CPG-style controller (sinusoidal references with joint-level PD feedback), and two PPO policies (Stable-Baselines3) trained with identical procedures: one observes the morphology vector, one does not.
 - **Protocol.** Four perturbation axes × six levels × 10 episodes per controller and training seed, five training seeds per PPO arm.
-- **Analysis.** Per-seed aggregation, aware-minus-blind comparisons with confidence intervals, leave-one-seed-out checks, and figure scripts.
-
+- **Analysis.** Per-seed aggregation, primary unpaired Welch
+  comparisons with 95% confidence intervals, leave-one-seed-out
+  checks, and figure generation scripts.
+  
 ## Important design notes
 
 - **The decoder is not connected to the controllers.** The controller experiments use a fixed schedule (Forward → Left → Right → Stop, 150 steps each, repeating over the 1000-step episode). Decoder errors never reach them.
@@ -175,7 +177,7 @@ If you use this code, please cite the paper. Publication details will be added w
 
 ```bibtex
 @misc{jaiswal2026morphology,
-  title  = {Decoupling Neural Intent from Body-Specific Motor Control: A Synthetic-EEG Study of Robustness to Physical Variation in Full-Physics Simulated Legged Locomotion},
+  title  = {Morphology-Conditioned Locomotion Policies Under Physical Variation: A Controlled Simulation Study},
   author = {Jaiswal, Maitree},
   year   = {2026},
   url    = {https://github.com/maitreejais-pixel/neural-intent-morphology-robustness}
