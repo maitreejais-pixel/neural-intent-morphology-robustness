@@ -30,8 +30,9 @@ What it does
   conditions, nominal only, perturbed only (10-50%), each axis, and
   leaving out one training seed at a time.
 * The two arms do not share an initialization, so "paired by seed" only
-  means matched by seed INDEX. The unpaired Welch test is the main test;
-  the matched test is shown for completeness. With 5 seeds both have very
+  means matched by seed INDEX. The unpaired Welch test AND ITS CONFIDENCE
+  INTERVAL are the primary inference; the matched-by-index test and interval
+  are shown as a sensitivity analysis only. With 5 seeds both have very
   little power: treat p-values as descriptive.
 * There is deliberately NO "drop from nominal" table. That quantity is
   (perturbed difference) - (nominal difference); when the nominal scores
@@ -215,8 +216,10 @@ def compare_block(block, sub, metrics=COMPARED):
             "blind_mean": float(b[m].mean()),
             "diff_mean": float(d.mean()),
             "diff_sd": sd,
-            "ci95_low": float("nan"),
+            "ci95_low": float("nan"),          # Welch 95% CI of the difference (primary)
             "ci95_high": float("nan"),
+            "ci95_matched_low": float("nan"),  # CI of the per-seed-index differences (sensitivity only)
+            "ci95_matched_high": float("nan"),
             "seeds_aware_higher": int((d > 0).sum()),
             "per_seed_diffs": ", ".join(f"{x:+.3f}" for x in d),
             "p_welch": float("nan"),
@@ -225,21 +228,28 @@ def compare_block(block, sub, metrics=COMPARED):
 
         if n >= 3 and sd > 0:
 
+            # Primary inference: unpaired Welch test and its confidence interval
+            # (the two arms are independently trained, so they are independent samples).
+            welch = stats.ttest_ind(
+                a[m].to_numpy(),
+                b[m].to_numpy(),
+                equal_var=False,
+            )
+
+            ci = welch.confidence_interval(confidence_level=0.95)
+
+            row["p_welch"] = float(welch.pvalue)
+            row["ci95_low"] = float(ci.low)
+            row["ci95_high"] = float(ci.high)
+
+            # Sensitivity only: differences matched by seed INDEX.
             half = stats.t.ppf(0.975, n - 1) * sd / np.sqrt(n)
 
-            row["ci95_low"] = float(d.mean() - half)
-            row["ci95_high"] = float(d.mean() + half)
+            row["ci95_matched_low"] = float(d.mean() - half)
+            row["ci95_matched_high"] = float(d.mean() + half)
 
             row["p_matched_by_seed"] = float(
                 stats.ttest_1samp(d.to_numpy(), 0.0).pvalue
-            )
-
-            row["p_welch"] = float(
-                stats.ttest_ind(
-                    a[m].to_numpy(),
-                    b[m].to_numpy(),
-                    equal_var=False,
-                ).pvalue
             )
 
         rows.append(row)
@@ -254,13 +264,15 @@ def print_block(frame):
         print(
             f"{r['metric']:13s} aware {r['aware_mean']:8.3f} | "
             f"blind {r['blind_mean']:8.3f} | "
-            f"diff {r['diff_mean']:+8.3f} (sd {r['diff_sd']:.3f}, "
-            f"95% CI [{r['ci95_low']:+.3f}, {r['ci95_high']:+.3f}]) | "
+            f"diff {r['diff_mean']:+8.3f} | "
+            f"Welch 95% CI [{r['ci95_low']:+.3f}, {r['ci95_high']:+.3f}] | "
+            f"Welch p={r['p_welch']:.3f} | "
             f"aware higher in {int(r['seeds_aware_higher'])}/{int(r['n_seeds'])} seeds"
         )
         print(
-            f"{'':13s} per seed [{r['per_seed_diffs']}] | "
-            f"Welch p={r['p_welch']:.3f} | matched-by-seed p={r['p_matched_by_seed']:.3f}"
+            f"{'':13s} per seed [{r['per_seed_diffs']}] (sd {r['diff_sd']:.3f}) | "
+            f"sensitivity, matched by seed index: CI [{r['ci95_matched_low']:+.3f}, "
+            f"{r['ci95_matched_high']:+.3f}], p={r['p_matched_by_seed']:.3f}"
         )
 
 

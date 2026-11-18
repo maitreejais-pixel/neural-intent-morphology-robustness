@@ -149,11 +149,13 @@ def main():
 
         if n >= 3 and d.std(ddof=1) > 0:
 
-            half = stats.t.ppf(0.975, n - 1) * d.std(ddof=1) / np.sqrt(n)
+            welch = stats.ttest_ind(a, b, equal_var=False)
+
+            ci = welch.confidence_interval(confidence_level=0.95)
 
             line += (
-                f" | 95% CI [{d.mean() - half:+.3f}, {d.mean() + half:+.3f}]"
-                f" | Welch p={stats.ttest_ind(a, b, equal_var=False).pvalue:.3f}"
+                f" | Welch 95% CI [{ci.low:+.3f}, {ci.high:+.3f}]"
+                f" | Welch p={welch.pvalue:.3f}"
             )
 
         print(line)
