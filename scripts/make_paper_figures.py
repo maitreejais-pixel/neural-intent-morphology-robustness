@@ -53,9 +53,9 @@ BLIND = "ppo-no-morphology"
 
 STYLE = {
     "direct": ("Direct", "#1f77b4", "s", "-"),
-    "cpg": ("CPG + PD", "#d62728", "^", "--"),
+    "cpg": ("CPG-style", "#d62728", "^", "--"),
     AWARE: ("Morphology-aware PPO", "#2ca02c", "o", "-"),
-    BLIND: ("PPO, no morphology", "#ff7f0e", "v", "-."),
+    BLIND: ("Morphology-blind PPO", "#ff7f0e", "v", "-."),
     "standstill": ("Stand-still", "#7f7f7f", "D", ":"),
 }
 
@@ -223,7 +223,7 @@ def per_seed_figure(overall, outdir):
 
         ax.set_xlim(-0.7, 1.5)
         ax.set_xticks([0, 1])
-        ax.set_xticklabels(["Morphology-aware", "No morphology"])
+        ax.set_xticklabels(["Morphology-aware", "Morphology-blind"])
         ax.set_ylabel(label)
         ax.grid(axis="y", linestyle=":", alpha=0.6)
 
